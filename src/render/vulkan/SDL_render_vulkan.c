@@ -27,10 +27,65 @@
 #define SDL_VULKAN_MAX_NUM_TEXTURES   16384
 #define SDL_VULKAN_NUM_UPLOAD_BUFFERS 32
 
+#define VK_NO_PROTOTYPES
 #include "SDL_vulkan.h"
 #include <vulkan/vulkan.h>
 #include "../SDL_sysrender.h"
+#include "../SDL_sysvideo.h"
 #include "../SDL_d3dmath.h"
+
+#define VULKAN_FUNCTIONS()                                              \
+    VULKAN_DEVICE_FUNCTION(vkAcquireNextImageKHR)                       \
+    VULKAN_DEVICE_FUNCTION(vkAllocateCommandBuffers)                    \
+    VULKAN_DEVICE_FUNCTION(vkBeginCommandBuffer)                        \
+    VULKAN_DEVICE_FUNCTION(vkCmdClearColorImage)                        \
+    VULKAN_DEVICE_FUNCTION(vkCmdPipelineBarrier)                        \
+    VULKAN_DEVICE_FUNCTION(vkCreateCommandPool)                         \
+    VULKAN_DEVICE_FUNCTION(vkCreateFence)                               \
+    VULKAN_DEVICE_FUNCTION(vkCreateImageView)                           \
+    VULKAN_DEVICE_FUNCTION(vkCreateSemaphore)                           \
+    VULKAN_DEVICE_FUNCTION(vkCreateSwapchainKHR)                        \
+    VULKAN_DEVICE_FUNCTION(vkDestroyCommandPool)                        \
+    VULKAN_DEVICE_FUNCTION(vkDestroyDevice)                             \
+    VULKAN_DEVICE_FUNCTION(vkDestroyFence)                              \
+    VULKAN_DEVICE_FUNCTION(vkDestroyImageView)                          \
+    VULKAN_DEVICE_FUNCTION(vkDestroySemaphore)                          \
+    VULKAN_DEVICE_FUNCTION(vkDestroySwapchainKHR)                       \
+    VULKAN_DEVICE_FUNCTION(vkDeviceWaitIdle)                            \
+    VULKAN_DEVICE_FUNCTION(vkEndCommandBuffer)                          \
+    VULKAN_DEVICE_FUNCTION(vkFreeCommandBuffers)                        \
+    VULKAN_DEVICE_FUNCTION(vkGetDeviceQueue)                            \
+    VULKAN_DEVICE_FUNCTION(vkGetFenceStatus)                            \
+    VULKAN_DEVICE_FUNCTION(vkGetSwapchainImagesKHR)                     \
+    VULKAN_DEVICE_FUNCTION(vkQueuePresentKHR)                           \
+    VULKAN_DEVICE_FUNCTION(vkQueueSubmit)                               \
+    VULKAN_DEVICE_FUNCTION(vkResetCommandBuffer)                        \
+    VULKAN_DEVICE_FUNCTION(vkResetFences)                               \
+    VULKAN_DEVICE_FUNCTION(vkWaitForFences)                             \
+    VULKAN_GLOBAL_FUNCTION(vkCreateInstance)                            \
+    VULKAN_GLOBAL_FUNCTION(vkEnumerateInstanceExtensionProperties)      \
+    VULKAN_GLOBAL_FUNCTION(vkEnumerateInstanceLayerProperties)          \
+    VULKAN_INSTANCE_FUNCTION(vkCreateDevice)                            \
+    VULKAN_INSTANCE_FUNCTION(vkDestroyInstance)                         \
+    VULKAN_INSTANCE_FUNCTION(vkDestroySurfaceKHR)                       \
+    VULKAN_INSTANCE_FUNCTION(vkEnumerateDeviceExtensionProperties)      \
+    VULKAN_INSTANCE_FUNCTION(vkEnumeratePhysicalDevices)                \
+    VULKAN_INSTANCE_FUNCTION(vkGetDeviceProcAddr)                       \
+    VULKAN_INSTANCE_FUNCTION(vkGetPhysicalDeviceFeatures)               \
+    VULKAN_INSTANCE_FUNCTION(vkGetPhysicalDeviceProperties)             \
+    VULKAN_INSTANCE_FUNCTION(vkGetPhysicalDeviceQueueFamilyProperties)  \
+    VULKAN_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
+    VULKAN_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceFormatsKHR)      \
+    VULKAN_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfacePresentModesKHR) \
+    VULKAN_INSTANCE_FUNCTION(vkGetPhysicalDeviceSurfaceSupportKHR)
+
+#define VULKAN_DEVICE_FUNCTION(name)   static PFN_##name name = NULL;
+#define VULKAN_GLOBAL_FUNCTION(name)   static PFN_##name name = NULL;
+#define VULKAN_INSTANCE_FUNCTION(name) static PFN_##name name = NULL;
+VULKAN_FUNCTIONS()
+#undef VULKAN_DEVICE_FUNCTION
+#undef VULKAN_GLOBAL_FUNCTION
+#undef VULKAN_INSTANCE_FUNCTION
 
 /* Vertex shader, common values */
 typedef struct
@@ -125,6 +180,15 @@ typedef struct
 /* Private renderer data */
 typedef struct
 {
+    PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
+    VkInstance instance;
+    VkSurfaceKHR surface;
+    VkPhysicalDevice physicalDevice;
+    VkPhysicalDeviceProperties physicalDeviceProperties;
+    VkPhysicalDeviceFeatures physicalDeviceFeatures;
+    VkDevice device;
+    uint32_t graphicsQueueFamilyIndex;
+    uint32_t presentQueueFamilyIndex;
 #if D3D12_PORT
     IVULKANDevice1 *d3dDevice;
     IVULKANDebug *debugInterface;
@@ -198,8 +262,28 @@ typedef struct
 
 static void VULKAN_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture);
 
-static void VULKAN_ReleaseAll(SDL_Renderer *renderer)
+static void VULKAN_DestroyAll(SDL_Renderer *renderer)
 {
+    VULKAN_RenderData *data;
+    if (renderer == NULL) {
+        return;
+    }
+    data = (VULKAN_RenderData *)renderer->driverdata;
+    if (data == NULL) {
+        return;
+    }
+    if (data->device != VK_NULL_HANDLE) {
+        vkDestroyDevice(data->device, NULL);
+        data->device = VK_NULL_HANDLE;
+    }
+    if (data->surface != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(data->instance, data->surface, NULL);
+        data->surface = VK_NULL_HANDLE;
+    }
+    if (data->instance != VK_NULL_HANDLE) {
+        vkDestroyInstance(data->instance, NULL);
+        data->instance = VK_NULL_HANDLE;
+    }
 #if D3D12_PORT
     VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
     SDL_Texture *texture = NULL;
@@ -280,8 +364,6 @@ static void VULKAN_ReleaseAll(SDL_Renderer *renderer)
             data->hDXGIMod = NULL;
         }
     }
-#else
-    int port;
 #endif
 }
 
@@ -355,15 +437,13 @@ static int VULKAN_IssueBatch(VULKAN_RenderData *data)
 
 static void VULKAN_DestroyRenderer(SDL_Renderer *renderer)
 {
-#if D3D12_PORT
     VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
     VULKAN_WaitForGPU(data);
-    VULKAN_ReleaseAll(renderer);
+    VULKAN_DestroyAll(renderer);
     if (data) {
         SDL_free(data);
     }
     SDL_free(renderer);
-#endif
 }
 
 #if D3D12_PORT
@@ -512,9 +592,292 @@ static VkResult VULKAN_CreateVertexBuffer(VULKAN_RenderData *data, size_t vbidx,
 #endif
 }
 
+static int VULKAN_LoadGlobalFunctions(VULKAN_RenderData *data)
+{
+#define VULKAN_DEVICE_FUNCTION(name)
+#define VULKAN_GLOBAL_FUNCTION(name)                                                   \
+    name = (PFN_##name)data->vkGetInstanceProcAddr(VK_NULL_HANDLE, #name);             \
+    if (!name) {                                                                       \
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER,                                          \
+                     "vkGetInstanceProcAddr(VK_NULL_HANDLE, \"" #name "\") failed\n"); \
+        return -1;                                                                     \
+    }
+#define VULKAN_INSTANCE_FUNCTION(name)
+    VULKAN_FUNCTIONS()
+#undef VULKAN_DEVICE_FUNCTION
+#undef VULKAN_GLOBAL_FUNCTION
+#undef VULKAN_INSTANCE_FUNCTION
+
+    return 0;
+}
+
+static int VULKAN_LoadInstanceFunctions(VULKAN_RenderData *data)
+{
+#define VULKAN_DEVICE_FUNCTION(name)
+#define VULKAN_GLOBAL_FUNCTION(name)
+#define VULKAN_INSTANCE_FUNCTION(name)                                              \
+    name = (PFN_##name)data->vkGetInstanceProcAddr(data->instance, #name);          \
+    if (!name) {                                                                    \
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER,                                       \
+                     "vkGetInstanceProcAddr(instance, \"" #name "\") failed\n");    \
+        return -1;                                                                  \
+    }
+    VULKAN_FUNCTIONS()
+#undef VULKAN_DEVICE_FUNCTION
+#undef VULKAN_GLOBAL_FUNCTION
+#undef VULKAN_INSTANCE_FUNCTION
+
+    return 0;
+}
+
+static int VULKAN_LoadDeviceFunctions(VULKAN_RenderData *data)
+{
+#define VULKAN_DEVICE_FUNCTION(name)                                         \
+    name = (PFN_##name)vkGetDeviceProcAddr(data->device, #name);             \
+    if (!name) {                                                             \
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER,                                \
+                     "vkGetDeviceProcAddr(device, \"" #name "\") failed\n"); \
+        return -1;                                                           \
+    }
+#define VULKAN_GLOBAL_FUNCTION(name)
+#define VULKAN_INSTANCE_FUNCTION(name)
+    VULKAN_FUNCTIONS()
+#undef VULKAN_DEVICE_FUNCTION
+#undef VULKAN_GLOBAL_FUNCTION
+#undef VULKAN_INSTANCE_FUNCTION
+    return 0;
+}
+
+static VkResult VULKAN_FindPhysicalDevice(VULKAN_RenderData *data)
+{
+    uint32_t physicalDeviceCount = 0;
+    VkPhysicalDevice *physicalDevices;
+    VkQueueFamilyProperties *queueFamiliesProperties = NULL;
+    uint32_t queueFamiliesPropertiesAllocatedSize = 0;
+    VkExtensionProperties *deviceExtensions = NULL;
+    uint32_t deviceExtensionsAllocatedSize = 0;
+    uint32_t physicalDeviceIndex;
+    VkResult result;
+
+    result = vkEnumeratePhysicalDevices(data->instance, &physicalDeviceCount, NULL);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkEnumeratePhysicalDevices(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+    if (physicalDeviceCount == 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkEnumeratePhysicalDevices(): no physical devices\n");
+        return VK_ERROR_UNKNOWN;
+    }
+    physicalDevices = (VkPhysicalDevice *)SDL_malloc(sizeof(VkPhysicalDevice) * physicalDeviceCount);
+    result = vkEnumeratePhysicalDevices(data->instance, &physicalDeviceCount, physicalDevices);
+    if (result != VK_SUCCESS) {
+        SDL_free(physicalDevices);
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER,"vkEnumeratePhysicalDevices(): %s\n",SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+    data->physicalDevice = NULL;
+    for (physicalDeviceIndex = 0; physicalDeviceIndex < physicalDeviceCount; physicalDeviceIndex++) {
+        uint32_t queueFamiliesCount = 0;
+        uint32_t queueFamilyIndex;
+        uint32_t deviceExtensionCount = 0;
+        SDL_bool hasSwapchainExtension = SDL_FALSE;
+        uint32_t i;
+
+        VkPhysicalDevice physicalDevice = physicalDevices[physicalDeviceIndex];
+        vkGetPhysicalDeviceProperties(physicalDevice, &data->physicalDeviceProperties);
+        if (VK_VERSION_MAJOR(data->physicalDeviceProperties.apiVersion) < 1) {
+            continue;
+        }
+        vkGetPhysicalDeviceFeatures(physicalDevice, &data->physicalDeviceFeatures);
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamiliesCount, NULL);
+        if (queueFamiliesCount == 0) {
+            continue;
+        }
+        if (queueFamiliesPropertiesAllocatedSize < queueFamiliesCount) {
+            SDL_free(queueFamiliesProperties);
+            queueFamiliesPropertiesAllocatedSize = queueFamiliesCount;
+            queueFamiliesProperties = (VkQueueFamilyProperties *)SDL_malloc(sizeof(VkQueueFamilyProperties) * queueFamiliesPropertiesAllocatedSize);
+            if (!queueFamiliesProperties) {
+                SDL_free(physicalDevices);
+                SDL_free(deviceExtensions);
+                return VK_ERROR_UNKNOWN;
+            }
+        }
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamiliesCount, queueFamiliesProperties);
+        data->graphicsQueueFamilyIndex = queueFamiliesCount;
+        data->presentQueueFamilyIndex = queueFamiliesCount;
+        for (queueFamilyIndex = 0; queueFamilyIndex < queueFamiliesCount; queueFamilyIndex++) {
+            VkBool32 supported = 0;
+
+            if (queueFamiliesProperties[queueFamilyIndex].queueCount == 0) {
+                continue;
+            }
+
+            if (queueFamiliesProperties[queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                data->graphicsQueueFamilyIndex = queueFamilyIndex;
+            }
+
+            result = vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, queueFamilyIndex, data->surface, &supported);
+            if (result != VK_SUCCESS) {
+                SDL_free(physicalDevices);
+                SDL_free(queueFamiliesProperties);
+                SDL_free(deviceExtensions);
+                SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkGetPhysicalDeviceSurfaceSupportKHR(): %s\n", SDL_Vulkan_GetResultString(result));
+                return VK_ERROR_UNKNOWN;
+            }
+            if (supported) {
+                data->presentQueueFamilyIndex = queueFamilyIndex;
+                if (queueFamiliesProperties[queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                    break; // use this queue because it can present and do graphics
+                }
+            }
+        }
+
+        if (data->graphicsQueueFamilyIndex == queueFamiliesCount) { // no good queues found
+            continue;
+        }
+        if (data->presentQueueFamilyIndex == queueFamiliesCount) { // no good queues found
+            continue;
+        }
+        result = vkEnumerateDeviceExtensionProperties(physicalDevice, NULL, &deviceExtensionCount, NULL);
+        if (result != VK_SUCCESS) {
+            SDL_free(physicalDevices);
+            SDL_free(queueFamiliesProperties);
+            SDL_free(deviceExtensions);
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkEnumerateDeviceExtensionProperties(): %s\n", SDL_Vulkan_GetResultString(result));
+            return VK_ERROR_UNKNOWN;
+        }
+        if (deviceExtensionCount == 0) {
+            continue;
+        }
+        if (deviceExtensionsAllocatedSize < deviceExtensionCount) {
+            SDL_free(deviceExtensions);
+            deviceExtensionsAllocatedSize = deviceExtensionCount;
+            deviceExtensions = SDL_malloc(sizeof(VkExtensionProperties) * deviceExtensionsAllocatedSize);
+            if (!deviceExtensions) {
+                SDL_free(physicalDevices);
+                SDL_free(queueFamiliesProperties);
+                return VK_ERROR_UNKNOWN;
+            }
+        }
+        result = vkEnumerateDeviceExtensionProperties(physicalDevice, NULL, &deviceExtensionCount, deviceExtensions);
+        if (result != VK_SUCCESS) {
+            SDL_free(physicalDevices);
+            SDL_free(queueFamiliesProperties);
+            SDL_free(deviceExtensions);
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkEnumerateDeviceExtensionProperties(): %s\n", SDL_Vulkan_GetResultString(result));
+            return result;
+        }
+        for (i = 0; i < deviceExtensionCount; i++) {
+            if (SDL_strcmp(deviceExtensions[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
+                hasSwapchainExtension = SDL_TRUE;
+                break;
+            }
+        }
+        if (!hasSwapchainExtension) {
+            continue;
+        }
+        data->physicalDevice = physicalDevice;
+        break;
+    }
+    SDL_free(physicalDevices);
+    SDL_free(queueFamiliesProperties);
+    SDL_free(deviceExtensions);
+    if (!data->physicalDevice) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Vulkan: no viable physical devices found");
+        return VK_ERROR_UNKNOWN;
+    }
+    return VK_SUCCESS;
+}
 /* Create resources that depend on the device. */
 static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
 {
+    VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
+    SDL_VideoDevice *device = SDL_GetVideoDevice();
+    VkResult result = VK_SUCCESS;
+    PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = NULL;
+
+    if (SDL_Vulkan_LoadLibrary(NULL) < 0) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_RENDER, "SDL_Vulkan_LoadLibrary failed." );
+        return VK_ERROR_UNKNOWN;
+    }
+    vkGetInstanceProcAddr = device ? (PFN_vkGetInstanceProcAddr)device->vulkan_config.vkGetInstanceProcAddr : NULL;
+    if(!vkGetInstanceProcAddr) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_RENDER, "vkGetInstanceProcAddr is NULL" );
+        return VK_ERROR_UNKNOWN;
+    }
+
+    /* Load global Vulkan functions */
+    data->vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+    if (VULKAN_LoadGlobalFunctions(data) != 0) {
+        return VK_ERROR_UNKNOWN;
+    }
+
+    /* Create VkInstance */
+    VkInstanceCreateInfo instanceCreateInfo = { 0 };
+    VkApplicationInfo appInfo = { 0 };
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    appInfo.apiVersion = VK_API_VERSION_1_0;
+    instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    instanceCreateInfo.pApplicationInfo = &appInfo;
+    instanceCreateInfo.ppEnabledExtensionNames = SDL_Vulkan_GetInstanceExtensions(&instanceCreateInfo.enabledExtensionCount);
+    result = vkCreateInstance(&instanceCreateInfo, NULL, &data->instance);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateInstance(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+
+    /* Load instance Vulkan functions */
+    if (VULKAN_LoadInstanceFunctions(data) != 0) {
+        VULKAN_DestroyAll(renderer);
+        return VK_ERROR_UNKNOWN;
+    }
+
+    /* Create Vulkan surface */
+    if (!device->Vulkan_CreateSurface || !device->Vulkan_CreateSurface(device, renderer->window, data->instance, NULL, &data->surface)) {
+        VULKAN_DestroyAll(renderer);
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Vulkan_CreateSurface() failed.\n");
+        return VK_ERROR_UNKNOWN;
+    }
+
+    /* Choose Vulkan physical device */
+    if (VULKAN_FindPhysicalDevice(data) != VK_SUCCESS) {
+        VULKAN_DestroyAll(renderer);
+        return VK_ERROR_UNKNOWN;
+    }
+
+    /* Create Vulkan device */
+    VkDeviceQueueCreateInfo deviceQueueCreateInfo[1] = { { 0 } };
+    static const float queuePriority[] = { 1.0f };
+    VkDeviceCreateInfo deviceCreateInfo = { 0 };
+    static const char *const deviceExtensionNames[] = {
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    };
+
+    deviceQueueCreateInfo->sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    deviceQueueCreateInfo->queueFamilyIndex = data->graphicsQueueFamilyIndex;
+    deviceQueueCreateInfo->queueCount = 1;
+    deviceQueueCreateInfo->pQueuePriorities = &queuePriority[0];
+
+    deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    deviceCreateInfo.queueCreateInfoCount = 1;
+    deviceCreateInfo.pQueueCreateInfos = deviceQueueCreateInfo;
+    deviceCreateInfo.pEnabledFeatures = NULL;
+    deviceCreateInfo.enabledExtensionCount = SDL_arraysize(deviceExtensionNames);
+    deviceCreateInfo.ppEnabledExtensionNames = deviceExtensionNames;
+    result = vkCreateDevice(data->physicalDevice, &deviceCreateInfo, NULL, &data->device);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateDevice(): %s\n", SDL_Vulkan_GetResultString(result));
+        VULKAN_DestroyAll(renderer);
+        return result;
+    }
+
+    if(VULKAN_LoadDeviceFunctions(data) != 0) {
+        VULKAN_DestroyAll(renderer);
+        return VK_ERROR_UNKNOWN;
+    }
+
+    
 #if D3D12_PORT
 #if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
     typedef HRESULT(WINAPI * PFN_CREATE_DXGI_FACTORY)(UINT flags, REFIID riid, void **ppFactory);
@@ -524,7 +887,6 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
     typedef HANDLE(WINAPI * PFN_CREATE_EVENT_EX)(LPSECURITY_ATTRIBUTES lpEventAttributes, LPCWSTR lpName, DWORD dwFlags, DWORD dwDesiredAccess);
     PFN_CREATE_EVENT_EX CreateEventExFunc;
 
-    VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
     IVULKANDevice *d3dDevice = NULL;
     HRESULT result = S_OK;
     UINT creationFlags = 0;
