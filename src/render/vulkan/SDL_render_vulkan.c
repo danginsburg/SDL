@@ -32,7 +32,8 @@
 #include <vulkan/vulkan.h>
 #include "../SDL_sysrender.h"
 #include "../SDL_sysvideo.h"
-#include "../SDL_d3dmath.h"
+
+extern const char *SDL_Vulkan_GetResultString(VkResult result);
 
 #define VULKAN_FUNCTIONS()                                              \
     VULKAN_DEVICE_FUNCTION(vkAcquireNextImageKHR)                       \
@@ -90,15 +91,21 @@ VULKAN_FUNCTIONS()
 /* Vertex shader, common values */
 typedef struct
 {
+#if D3D12_PORT
     Float4X4 model;
     Float4X4 projectionAndView;
+#else
+	int port;
+#endif
 } VertexShaderConstants;
 
 /* Per-vertex data */
 typedef struct
 {
+#if D3D12_PORT
     Float2 pos;
     Float2 tex;
+#endif
     SDL_FColor color;
 } VertexPositionColor;
 
@@ -189,6 +196,22 @@ typedef struct
     VkDevice device;
     uint32_t graphicsQueueFamilyIndex;
     uint32_t presentQueueFamilyIndex;
+    VkSwapchainKHR swapchain;
+    uint32_t numSwapchainImages;
+    VkCommandPool commandPool;
+    VkCommandBuffer commandBuffers[SDL_VULKAN_NUM_BUFFERS];
+    VkFence fences[SDL_VULKAN_NUM_BUFFERS];
+    VkSurfaceCapabilitiesKHR surfaceCapabilities;
+    VkSurfaceFormatKHR *surfaceFormats;
+    uint32_t surfaceFormatsAllocatedCount;
+    uint32_t surfaceFormatsCount;
+    uint32_t swapchainDesiredImageCount;
+    VkSurfaceFormatKHR surfaceFormat;
+    VkExtent2D swapchainSize;
+    uint32_t swapchainImageCount;
+    VkImage *swapchainImages;
+    VkSemaphore imageAvailableSemaphore;
+
 #if D3D12_PORT
     IVULKANDevice1 *d3dDevice;
     IVULKANDebug *debugInterface;
@@ -272,6 +295,37 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
     if (data == NULL) {
         return;
     }
+    
+    if (data->surfaceFormats != NULL) {
+        SDL_free(data->surfaceFormats);
+        data->surfaceFormats = NULL;
+    }
+    if (data->swapchainImages != NULL) {
+        SDL_free(data->swapchainImages);
+        data->swapchainImages = NULL;
+    }
+    if (data->swapchain) {
+        vkDestroySwapchainKHR(data->device, data->swapchain, NULL);
+        data->swapchain = VK_NULL_HANDLE;
+    }
+    for (uint32_t i = 0; i < SDL_VULKAN_NUM_BUFFERS; i++) {
+        if (data->fences[i] != VK_NULL_HANDLE) {
+            vkDestroyFence(data->device, data->fences[i], NULL);
+            data->fences[i] = VK_NULL_HANDLE;
+        }
+    }
+    if (data->imageAvailableSemaphore) {
+        vkDestroySemaphore(data->device, data->imageAvailableSemaphore, NULL);
+        data->imageAvailableSemaphore = NULL;
+    }
+    if (data->commandPool) {
+        if (data->commandBuffers[0] != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(data->device, data->commandPool, SDL_VULKAN_NUM_BUFFERS, data->commandBuffers);
+            SDL_memset(data->commandBuffers, 0, sizeof(data->commandBuffers));
+        }
+        vkDestroyCommandPool(data->device, data->commandPool, NULL);
+        data->commandPool = VK_NULL_HANDLE;
+    }
     if (data->device != VK_NULL_HANDLE) {
         vkDestroyDevice(data->device, NULL);
         data->device = VK_NULL_HANDLE;
@@ -284,87 +338,6 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
         vkDestroyInstance(data->instance, NULL);
         data->instance = VK_NULL_HANDLE;
     }
-#if D3D12_PORT
-    VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
-    SDL_Texture *texture = NULL;
-
-    SDL_PropertiesID props = SDL_GetRendererProperties(renderer);
-    SDL_SetProperty(props, SDL_PROP_RENDERER_VULKAN_DEVICE_POINTER, NULL);
-    SDL_SetProperty(props, SDL_PROP_RENDERER_VULKAN_COMMAND_QUEUE_POINTER, NULL);
-
-    /* Release all textures */
-    for (texture = renderer->textures; texture; texture = texture->next) {
-        VULKAN_DestroyTexture(renderer, texture);
-    }
-
-    /* Release/reset everything else */
-    if (data) {
-        int i;
-
-#if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
-        SAFE_RELEASE(data->dxgiFactory);
-        SAFE_RELEASE(data->dxgiAdapter);
-        SAFE_RELEASE(data->swapChain);
-#endif
-        SAFE_RELEASE(data->d3dDevice);
-        SAFE_RELEASE(data->debugInterface);
-        SAFE_RELEASE(data->commandQueue);
-        SAFE_RELEASE(data->commandList);
-        SAFE_RELEASE(data->rtvDescriptorHeap);
-        SAFE_RELEASE(data->textureRTVDescriptorHeap);
-        SAFE_RELEASE(data->srvDescriptorHeap);
-        SAFE_RELEASE(data->samplerDescriptorHeap);
-        SAFE_RELEASE(data->fence);
-
-        for (i = 0; i < SDL_VULKAN_NUM_BUFFERS; ++i) {
-            SAFE_RELEASE(data->commandAllocators[i]);
-            SAFE_RELEASE(data->renderTargets[i]);
-        }
-
-        if (data->pipelineStateCount > 0) {
-            for (i = 0; i < data->pipelineStateCount; ++i) {
-                SAFE_RELEASE(data->pipelineStates[i].pipelineState);
-            }
-            SDL_free(data->pipelineStates);
-            data->pipelineStateCount = 0;
-        }
-
-        for (i = 0; i < NUM_ROOTSIGS; ++i) {
-            SAFE_RELEASE(data->rootSignatures[i]);
-        }
-
-        for (i = 0; i < SDL_VULKAN_NUM_VERTEX_BUFFERS; ++i) {
-            SAFE_RELEASE(data->vertexBuffers[i].resource);
-            data->vertexBuffers[i].size = 0;
-        }
-
-        data->swapEffect = (DXGI_SWAP_EFFECT)0;
-        data->swapFlags = 0;
-        data->currentRenderTargetView.ptr = 0;
-        data->currentSampler.ptr = 0;
-
-#if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
-        /* Check for any leaks if in debug mode */
-        if (data->dxgiDebug) {
-            DXGI_DEBUG_RLO_FLAGS rloFlags = (DXGI_DEBUG_RLO_FLAGS)(DXGI_DEBUG_RLO_SUMMARY | DXGI_DEBUG_RLO_IGNORE_INTERNAL);
-            D3D_CALL(data->dxgiDebug, ReportLiveObjects, SDL_DXGI_DEBUG_ALL, rloFlags);
-            SAFE_RELEASE(data->dxgiDebug);
-        }
-#endif
-
-        /* Unload the D3D libraries.  This should be done last, in order
-         * to prevent IUnknown::Release() calls from crashing.
-         */
-        if (data->hVULKANMod) {
-            SDL_UnloadObject(data->hVULKANMod);
-            data->hVULKANMod = NULL;
-        }
-        if (data->hDXGIMod) {
-            SDL_UnloadObject(data->hDXGIMod);
-            data->hDXGIMod = NULL;
-        }
-    }
-#endif
 }
 
 
@@ -789,6 +762,74 @@ static VkResult VULKAN_FindPhysicalDevice(VULKAN_RenderData *data)
     }
     return VK_SUCCESS;
 }
+
+static VkResult VULKAN_GetSurfaceFormats(VULKAN_RenderData *data)
+{
+    VkResult result = vkGetPhysicalDeviceSurfaceFormatsKHR(data->physicalDevice,
+                                                           data->surface,
+                                                           &data->surfaceFormatsCount,
+                                                           NULL);
+    if (result != VK_SUCCESS) {
+        data->surfaceFormatsCount = 0;
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkGetPhysicalDeviceSurfaceFormatsKHR(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+    if (data->surfaceFormatsCount > data->surfaceFormatsAllocatedCount) {
+        data->surfaceFormatsAllocatedCount = data->surfaceFormatsCount;
+        SDL_free(data->surfaceFormats);
+        data->surfaceFormats = (VkSurfaceFormatKHR *)SDL_malloc(sizeof(VkSurfaceFormatKHR) * data->surfaceFormatsAllocatedCount);
+    }
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(data->physicalDevice,
+                                                  data->surface,
+                                                  &data->surfaceFormatsCount,
+                                                  data->surfaceFormats);
+    if (result != VK_SUCCESS) {
+        data->surfaceFormatsCount = 0;
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkGetPhysicalDeviceSurfaceFormatsKHR(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+    
+    return VK_SUCCESS;
+}
+
+static VkSemaphore VULKAN_CreateSemaphore(VULKAN_RenderData *data)
+{
+    VkResult result;
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+
+    VkSemaphoreCreateInfo semaphoreCreateInfo = { 0 };
+    semaphoreCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    result = vkCreateSemaphore(data->device, &semaphoreCreateInfo, NULL, &semaphore);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateSemaphore(): %s\n", SDL_Vulkan_GetResultString(result));
+        return VK_NULL_HANDLE;
+    }
+    return semaphore;
+}
+
+static SDL_bool VULKAN_ValidationLayersFound()
+{
+    const char *validationLayerName = "VK_LAYER_KHRONOS_validation";
+    uint32_t instanceLayerCount = 0;
+    uint32_t i;
+    SDL_bool foundValidation = SDL_FALSE;
+    
+    vkEnumerateInstanceLayerProperties(&instanceLayerCount, NULL);
+    if (instanceLayerCount > 0) {
+        VkLayerProperties *instanceLayers = SDL_calloc(instanceLayerCount, sizeof(VkLayerProperties));
+        vkEnumerateInstanceLayerProperties(&instanceLayerCount, instanceLayers);
+        for (i = 0; i < instanceLayerCount; i++) {
+            if (!SDL_strcmp(validationLayerName, instanceLayers[i].layerName)) {
+                foundValidation = SDL_TRUE;
+                break;
+            }
+        }
+        SDL_free(instanceLayers);
+    }
+    
+    return foundValidation;
+}
+
 /* Create resources that depend on the device. */
 static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
 {
@@ -796,6 +837,7 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
     SDL_VideoDevice *device = SDL_GetVideoDevice();
     VkResult result = VK_SUCCESS;
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = NULL;
+    SDL_bool createDebug = SDL_GetHintBoolean(SDL_HINT_RENDER_VULKAN_DEBUG, SDL_FALSE);
 
     if (SDL_Vulkan_LoadLibrary(NULL) < 0) {
         SDL_LogDebug(SDL_LOG_CATEGORY_RENDER, "SDL_Vulkan_LoadLibrary failed." );
@@ -821,6 +863,11 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
     instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instanceCreateInfo.pApplicationInfo = &appInfo;
     instanceCreateInfo.ppEnabledExtensionNames = SDL_Vulkan_GetInstanceExtensions(&instanceCreateInfo.enabledExtensionCount);
+    if (createDebug && VULKAN_ValidationLayersFound()) {
+        const char *validationLayerName[] = { "VK_LAYER_KHRONOS_validation" };
+        instanceCreateInfo.ppEnabledLayerNames = validationLayerName;
+        instanceCreateInfo.enabledLayerCount = 1;
+    }
     result = vkCreateInstance(&instanceCreateInfo, NULL, &data->instance);
     if (result != VK_SUCCESS) {
         SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateInstance(): %s\n", SDL_Vulkan_GetResultString(result));
@@ -876,384 +923,56 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
         VULKAN_DestroyAll(renderer);
         return VK_ERROR_UNKNOWN;
     }
-
     
-#if D3D12_PORT
-#if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
-    typedef HRESULT(WINAPI * PFN_CREATE_DXGI_FACTORY)(UINT flags, REFIID riid, void **ppFactory);
-    PFN_CREATE_DXGI_FACTORY CreateDXGIFactoryFunc;
-    PFN_VULKAN_CREATE_DEVICE VULKANCreateDeviceFunc;
-#endif
-    typedef HANDLE(WINAPI * PFN_CREATE_EVENT_EX)(LPSECURITY_ATTRIBUTES lpEventAttributes, LPCWSTR lpName, DWORD dwFlags, DWORD dwDesiredAccess);
-    PFN_CREATE_EVENT_EX CreateEventExFunc;
+    /* Create command pool/command buffers */
+    VkCommandPoolCreateInfo commandPoolCreateInfo = { 0 };
+    commandPoolCreateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    commandPoolCreateInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    commandPoolCreateInfo.queueFamilyIndex = data->graphicsQueueFamilyIndex;
+    result = vkCreateCommandPool(data->device, &commandPoolCreateInfo, NULL, &data->commandPool);
+    if (result != VK_SUCCESS) {
+        VULKAN_DestroyAll(renderer);
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateCommandPool(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+    
+    VkCommandBufferAllocateInfo commandBufferAllocateInfo = { 0 };
+    commandBufferAllocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    commandBufferAllocateInfo.commandPool = data->commandPool;
+    commandBufferAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    commandBufferAllocateInfo.commandBufferCount = SDL_VULKAN_NUM_BUFFERS;
+    result = vkAllocateCommandBuffers(data->device, &commandBufferAllocateInfo, data->commandBuffers);
+    if (result != VK_SUCCESS) {
+        VULKAN_DestroyAll(renderer);
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkAllocateCommandBuffers(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
 
-    IVULKANDevice *d3dDevice = NULL;
-    HRESULT result = S_OK;
-    UINT creationFlags = 0;
-    int i, j, k, l;
-    SDL_bool createDebug;
-
-    VULKAN_COMMAND_QUEUE_DESC queueDesc;
-    VULKAN_DESCRIPTOR_HEAP_DESC descriptorHeapDesc;
-    VULKAN_SAMPLER_DESC samplerDesc;
-    IVULKANDescriptorHeap *rootDescriptorHeaps[2];
-
-    const SDL_BlendMode defaultBlendModes[] = {
-        SDL_BLENDMODE_NONE,
-        SDL_BLENDMODE_BLEND,
-        SDL_BLENDMODE_ADD,
-        SDL_BLENDMODE_MOD,
-        SDL_BLENDMODE_MUL
-    };
-    const DXGI_FORMAT defaultRTVFormats[] = {
-        DXGI_FORMAT_R16G16B16A16_FLOAT,
-        DXGI_FORMAT_R10G10B10A2_UNORM,
-        DXGI_FORMAT_B8G8R8A8_UNORM,
-        DXGI_FORMAT_B8G8R8X8_UNORM,
-        DXGI_FORMAT_R8_UNORM
-    };
-
-    /* See if we need debug interfaces */
-    createDebug = SDL_GetHintBoolean(SDL_HINT_RENDER_DIRECT3D11_DEBUG, SDL_FALSE);
-
-#ifdef SDL_PLATFORM_GDK
-    CreateEventExFunc = CreateEventExW;
-#else
-    /* CreateEventEx() arrived in Vista, so we need to load it with GetProcAddress for XP. */
-    {
-        HMODULE kernel32 = GetModuleHandle(TEXT("kernel32.dll"));
-        CreateEventExFunc = NULL;
-        if (kernel32) {
-            CreateEventExFunc = (PFN_CREATE_EVENT_EX)GetProcAddress(kernel32, "CreateEventExW");
+    /* Create fences */
+    for (uint32_t i = 0; i < SDL_VULKAN_NUM_BUFFERS; i++) {
+        VkFenceCreateInfo fenceCreateInfo = { 0 };
+        fenceCreateInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        result = vkCreateFence(data->device, &fenceCreateInfo, NULL, &data->fences[i]);
+        if (result != VK_SUCCESS) {
+            VULKAN_DestroyAll(renderer);
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateFence(): %s\n", SDL_Vulkan_GetResultString(result));
+            return result;
         }
     }
-#endif
-    if (!CreateEventExFunc) {
-        result = E_FAIL;
-        goto done;
+    
+    /* Create semaphores */
+    data->imageAvailableSemaphore = VULKAN_CreateSemaphore(data);
+    if (data->imageAvailableSemaphore == VK_NULL_HANDLE) {
+        VULKAN_DestroyAll(renderer);
+        return VK_ERROR_UNKNOWN;
+    }
+    if (VULKAN_GetSurfaceFormats(data) != VK_SUCCESS) {
+        VULKAN_DestroyAll(renderer);
+        return result;
     }
 
-#if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
-    data->hDXGIMod = SDL_LoadObject("dxgi.dll");
-    if (!data->hDXGIMod) {
-        result = E_FAIL;
-        goto done;
-    }
-
-    CreateDXGIFactoryFunc = (PFN_CREATE_DXGI_FACTORY)SDL_LoadFunction(data->hDXGIMod, "CreateDXGIFactory2");
-    if (!CreateDXGIFactoryFunc) {
-        result = E_FAIL;
-        goto done;
-    }
-
-    data->hVULKANMod = SDL_LoadObject("VULKAN.dll");
-    if (!data->hVULKANMod) {
-        result = E_FAIL;
-        goto done;
-    }
-
-    VULKANCreateDeviceFunc = (PFN_VULKAN_CREATE_DEVICE)SDL_LoadFunction(data->hVULKANMod, "VULKANCreateDevice");
-    if (!VULKANCreateDeviceFunc) {
-        result = E_FAIL;
-        goto done;
-    }
-
-    if (createDebug) {
-        PFN_VULKAN_GET_DEBUG_INTERFACE VULKANGetDebugInterfaceFunc;
-
-        VULKANGetDebugInterfaceFunc = (PFN_VULKAN_GET_DEBUG_INTERFACE)SDL_LoadFunction(data->hVULKANMod, "VULKANGetDebugInterface");
-        if (!VULKANGetDebugInterfaceFunc) {
-            result = E_FAIL;
-            goto done;
-        }
-        if (SUCCEEDED(VULKANGetDebugInterfaceFunc(D3D_GUID(SDL_IID_IVULKANDebug), (void **)&data->debugInterface))) {
-            D3D_CALL(data->debugInterface, EnableDebugLayer);
-        }
-    }
-#endif /*!defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)*/
-
-#if defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES)
-    result = VULKAN_XBOX_CreateDevice(&d3dDevice, createDebug);
-    if (FAILED(result)) {
-        /* SDL Error is set by VULKAN_XBOX_CreateDevice */
-        goto done;
-    }
-#else
-    if (createDebug) {
-#ifdef __IDXGIInfoQueue_INTERFACE_DEFINED__
-        IDXGIInfoQueue *dxgiInfoQueue = NULL;
-        PFN_CREATE_DXGI_FACTORY DXGIGetDebugInterfaceFunc;
-
-        /* If the debug hint is set, also create the DXGI factory in debug mode */
-        DXGIGetDebugInterfaceFunc = (PFN_CREATE_DXGI_FACTORY)SDL_LoadFunction(data->hDXGIMod, "DXGIGetDebugInterface1");
-        if (!DXGIGetDebugInterfaceFunc) {
-            result = E_FAIL;
-            goto done;
-        }
-
-        result = DXGIGetDebugInterfaceFunc(0, D3D_GUID(SDL_IID_IDXGIDebug1), (void **)&data->dxgiDebug);
-        if (FAILED(result)) {
-            WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("DXGIGetDebugInterface1"), result);
-            goto done;
-        }
-
-        result = DXGIGetDebugInterfaceFunc(0, D3D_GUID(SDL_IID_IDXGIInfoQueue), (void **)&dxgiInfoQueue);
-        if (FAILED(result)) {
-            WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("DXGIGetDebugInterface1"), result);
-            goto done;
-        }
-
-        D3D_CALL(dxgiInfoQueue, SetBreakOnSeverity, SDL_DXGI_DEBUG_ALL, DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR, TRUE);
-        D3D_CALL(dxgiInfoQueue, SetBreakOnSeverity, SDL_DXGI_DEBUG_ALL, DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION, TRUE);
-        SAFE_RELEASE(dxgiInfoQueue);
-#endif /* __IDXGIInfoQueue_INTERFACE_DEFINED__ */
-        creationFlags = DXGI_CREATE_FACTORY_DEBUG;
-    }
-
-    result = CreateDXGIFactoryFunc(creationFlags, D3D_GUID(SDL_IID_IDXGIFactory6), (void **)&data->dxgiFactory);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("CreateDXGIFactory"), result);
-        goto done;
-    }
-
-    /* Prefer a high performance adapter if there are multiple choices */
-    result = D3D_CALL(data->dxgiFactory, EnumAdapterByGpuPreference,
-                      0,
-                      DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                      D3D_GUID(SDL_IID_IDXGIAdapter4),
-                      (void **)&data->dxgiAdapter);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("VULKANCreateDevice"), result);
-        goto done;
-    }
-
-    result = VULKANCreateDeviceFunc((IUnknown *)data->dxgiAdapter,
-                                   D3D_FEATURE_LEVEL_11_0, /* Request minimum feature level 11.0 for maximum compatibility */
-                                   D3D_GUID(SDL_IID_IVULKANDevice1),
-                                   (void **)&d3dDevice);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("VULKANCreateDevice"), result);
-        goto done;
-    }
-
-    /* Setup the info queue if in debug mode */
-    if (createDebug) {
-        IVULKANInfoQueue *infoQueue = NULL;
-        VULKAN_MESSAGE_SEVERITY severities[] = { VULKAN_MESSAGE_SEVERITY_INFO };
-        VULKAN_INFO_QUEUE_FILTER filter;
-
-        result = D3D_CALL(d3dDevice, QueryInterface, D3D_GUID(SDL_IID_IVULKANInfoQueue), (void **)&infoQueue);
-        if (FAILED(result)) {
-            WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice to IVULKANInfoQueue"), result);
-            goto done;
-        }
-
-        SDL_zero(filter);
-        filter.DenyList.NumSeverities = 1;
-        filter.DenyList.pSeverityList = severities;
-        D3D_CALL(infoQueue, PushStorageFilter, &filter);
-
-        D3D_CALL(infoQueue, SetBreakOnSeverity, VULKAN_MESSAGE_SEVERITY_ERROR, TRUE);
-        D3D_CALL(infoQueue, SetBreakOnSeverity, VULKAN_MESSAGE_SEVERITY_CORRUPTION, TRUE);
-
-        SAFE_RELEASE(infoQueue);
-    }
-#endif /*!defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)*/
-
-    result = D3D_CALL(d3dDevice, QueryInterface, D3D_GUID(SDL_IID_IVULKANDevice1), (void **)&data->d3dDevice);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice to IVULKANDevice1"), result);
-        goto done;
-    }
-
-    /* Create a command queue */
-    SDL_zero(queueDesc);
-    queueDesc.Flags = VULKAN_COMMAND_QUEUE_FLAG_NONE;
-    queueDesc.Type = VULKAN_COMMAND_LIST_TYPE_DIRECT;
-
-    result = D3D_CALL(data->d3dDevice, CreateCommandQueue,
-                      &queueDesc,
-                      D3D_GUID(SDL_IID_IVULKANCommandQueue),
-                      (void **)&data->commandQueue);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateCommandQueue"), result);
-        goto done;
-    }
-
-    /* Create the descriptor heaps for the render target view, texture SRVs, and samplers */
-    SDL_zero(descriptorHeapDesc);
-    descriptorHeapDesc.NumDescriptors = SDL_VULKAN_NUM_BUFFERS;
-    descriptorHeapDesc.Type = VULKAN_DESCRIPTOR_HEAP_TYPE_RTV;
-    result = D3D_CALL(data->d3dDevice, CreateDescriptorHeap,
-                      &descriptorHeapDesc,
-                      D3D_GUID(SDL_IID_IVULKANDescriptorHeap),
-                      (void **)&data->rtvDescriptorHeap);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateDescriptorHeap [rtv]"), result);
-        goto done;
-    }
-    data->rtvDescriptorSize = D3D_CALL(d3dDevice, GetDescriptorHandleIncrementSize, VULKAN_DESCRIPTOR_HEAP_TYPE_RTV);
-
-    descriptorHeapDesc.NumDescriptors = SDL_VULKAN_MAX_NUM_TEXTURES;
-    result = D3D_CALL(data->d3dDevice, CreateDescriptorHeap,
-                      &descriptorHeapDesc,
-                      D3D_GUID(SDL_IID_IVULKANDescriptorHeap),
-                      (void **)&data->textureRTVDescriptorHeap);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateDescriptorHeap [texture rtv]"), result);
-        goto done;
-    }
-
-    SDL_zero(descriptorHeapDesc);
-    descriptorHeapDesc.NumDescriptors = SDL_VULKAN_MAX_NUM_TEXTURES;
-    descriptorHeapDesc.Type = VULKAN_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    descriptorHeapDesc.Flags = VULKAN_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    result = D3D_CALL(data->d3dDevice, CreateDescriptorHeap,
-                      &descriptorHeapDesc,
-                      D3D_GUID(SDL_IID_IVULKANDescriptorHeap),
-                      (void **)&data->srvDescriptorHeap);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateDescriptorHeap  [srv]"), result);
-        goto done;
-    }
-    rootDescriptorHeaps[0] = data->srvDescriptorHeap;
-    data->srvDescriptorSize = D3D_CALL(d3dDevice, GetDescriptorHandleIncrementSize, VULKAN_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-
-    SDL_zero(descriptorHeapDesc);
-    descriptorHeapDesc.NumDescriptors = 2;
-    descriptorHeapDesc.Type = VULKAN_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    descriptorHeapDesc.Flags = VULKAN_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    result = D3D_CALL(data->d3dDevice, CreateDescriptorHeap,
-                      &descriptorHeapDesc,
-                      D3D_GUID(SDL_IID_IVULKANDescriptorHeap),
-                      (void **)&data->samplerDescriptorHeap);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateDescriptorHeap  [sampler]"), result);
-        goto done;
-    }
-    rootDescriptorHeaps[1] = data->samplerDescriptorHeap;
-    data->samplerDescriptorSize = D3D_CALL(d3dDevice, GetDescriptorHandleIncrementSize, VULKAN_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-
-    /* Create a command allocator for each back buffer */
-    for (i = 0; i < SDL_VULKAN_NUM_BUFFERS; ++i) {
-        result = D3D_CALL(data->d3dDevice, CreateCommandAllocator,
-                          VULKAN_COMMAND_LIST_TYPE_DIRECT,
-                          D3D_GUID(SDL_IID_IVULKANCommandAllocator),
-                          (void **)&data->commandAllocators[i]);
-        if (FAILED(result)) {
-            WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateCommandAllocator"), result);
-            goto done;
-        }
-    }
-
-    /* Create the command list */
-    result = D3D_CALL(data->d3dDevice, CreateCommandList,
-                      0,
-                      VULKAN_COMMAND_LIST_TYPE_DIRECT,
-                      data->commandAllocators[0],
-                      NULL,
-                      D3D_GUID(SDL_IID_IVULKANGraphicsCommandList2),
-                      (void **)&data->commandList);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateCommandList"), result);
-        goto done;
-    }
-
-    /* Set the descriptor heaps to the correct initial value */
-    D3D_CALL(data->commandList, SetDescriptorHeaps, 2, rootDescriptorHeaps);
-
-    /* Create the fence and fence event */
-    result = D3D_CALL(data->d3dDevice, CreateFence,
-                      data->fenceValue,
-                      VULKAN_FENCE_FLAG_NONE,
-                      D3D_GUID(SDL_IID_IVULKANFence),
-                      (void **)&data->fence);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateFence"), result);
-        goto done;
-    }
-
-    data->fenceValue++;
-
-    data->fenceEvent = CreateEventExFunc(NULL, NULL, 0, EVENT_MODIFY_STATE | SYNCHRONIZE);
-    if (!data->fenceEvent) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("CreateEventEx"), result);
-        goto done;
-    }
-
-    /* Create all the root signatures */
-    for (i = 0; i < NUM_ROOTSIGS; ++i) {
-        VULKAN_SHADER_BYTECODE rootSigData;
-        VULKAN_GetRootSignatureData((VULKAN_RootSignature)i, &rootSigData);
-        result = D3D_CALL(data->d3dDevice, CreateRootSignature,
-                          0,
-                          rootSigData.pShaderBytecode,
-                          rootSigData.BytecodeLength,
-                          D3D_GUID(SDL_IID_IVULKANRootSignature),
-                          (void **)&data->rootSignatures[i]);
-        if (FAILED(result)) {
-            WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateRootSignature"), result);
-            goto done;
-        }
-    }
-
-    /* Create all the default pipeline state objects
-       (will add everything except custom blend states) */
-    for (i = 0; i < NUM_SHADERS; ++i) {
-        for (j = 0; j < SDL_arraysize(defaultBlendModes); ++j) {
-            for (k = VULKAN_PRIMITIVE_TOPOLOGY_TYPE_POINT; k < VULKAN_PRIMITIVE_TOPOLOGY_TYPE_PATCH; ++k) {
-                for (l = 0; l < SDL_arraysize(defaultRTVFormats); ++l) {
-                    if (!VULKAN_CreatePipelineState(renderer, (VULKAN_Shader)i, defaultBlendModes[j], (VULKAN_PRIMITIVE_TOPOLOGY_TYPE)k, defaultRTVFormats[l])) {
-                        /* VULKAN_CreatePipelineState will set the SDL error, if it fails */
-                        goto done;
-                    }
-                }
-            }
-        }
-    }
-
-    /* Create default vertex buffers  */
-    for (i = 0; i < SDL_VULKAN_NUM_VERTEX_BUFFERS; ++i) {
-        VULKAN_CreateVertexBuffer(data, i, VULKAN_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
-    }
-
-    /* Create samplers to use when drawing textures: */
-    SDL_zero(samplerDesc);
-    samplerDesc.Filter = VULKAN_FILTER_MIN_MAG_MIP_POINT;
-    samplerDesc.AddressU = VULKAN_TEXTURE_ADDRESS_MODE_CLAMP;
-    samplerDesc.AddressV = VULKAN_TEXTURE_ADDRESS_MODE_CLAMP;
-    samplerDesc.AddressW = VULKAN_TEXTURE_ADDRESS_MODE_CLAMP;
-    samplerDesc.MipLODBias = 0.0f;
-    samplerDesc.MaxAnisotropy = 1;
-    samplerDesc.ComparisonFunc = VULKAN_COMPARISON_FUNC_ALWAYS;
-    samplerDesc.MinLOD = 0.0f;
-    samplerDesc.MaxLOD = VULKAN_FLOAT32_MAX;
-    D3D_CALL_RET(data->samplerDescriptorHeap, GetCPUDescriptorHandleForHeapStart, &data->nearestPixelSampler);
-    D3D_CALL(data->d3dDevice, CreateSampler, &samplerDesc, data->nearestPixelSampler);
-
-    samplerDesc.Filter = VULKAN_FILTER_MIN_MAG_MIP_LINEAR;
-    data->linearSampler.ptr = data->nearestPixelSampler.ptr + data->samplerDescriptorSize;
-    D3D_CALL(data->d3dDevice, CreateSampler, &samplerDesc, data->linearSampler);
-
-    /* Initialize the pool allocator for SRVs */
-    for (i = 0; i < SDL_VULKAN_MAX_NUM_TEXTURES; ++i) {
-        data->srvPoolNodes[i].index = (SIZE_T)i;
-        if (i != SDL_VULKAN_MAX_NUM_TEXTURES - 1) {
-            data->srvPoolNodes[i].next = &data->srvPoolNodes[i + 1];
-        }
-    }
-    data->srvPoolHead = &data->srvPoolNodes[0];
-
-    SDL_PropertiesID props = SDL_GetRendererProperties(renderer);
-    SDL_SetProperty(props, SDL_PROP_RENDERER_VULKAN_DEVICE_POINTER, data->d3dDevice);
-    SDL_SetProperty(props, SDL_PROP_RENDERER_VULKAN_COMMAND_QUEUE_POINTER, data->commandQueue);
-
-done:
-    SAFE_RELEASE(d3dDevice);
-    return result;
-#else
     return VK_SUCCESS;
-#endif
 }
 
 #if D3D12_PORT
@@ -1330,10 +1049,103 @@ static int VULKAN_GetViewportAlignedD3DRect(SDL_Renderer *renderer, const SDL_Re
 
 static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
 {
-#if D3D12_PORT
     VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
-    IDXGISwapChain1 *swapChain = NULL;
-    HRESULT result = S_OK;
+    VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(data->physicalDevice, data->surface, &data->surfaceCapabilities);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+        
+    // pick an image count
+    data->swapchainDesiredImageCount = data->surfaceCapabilities.minImageCount + SDL_VULKAN_NUM_BUFFERS;
+    if ((data->swapchainDesiredImageCount > data->surfaceCapabilities.maxImageCount) &&
+        (data->surfaceCapabilities.maxImageCount > 0)) {
+        data->swapchainDesiredImageCount = data->surfaceCapabilities.maxImageCount;
+    }
+    
+    if ((data->surfaceFormatsCount == 1) &&
+        (data->surfaceFormats[0].format == VK_FORMAT_UNDEFINED)) {
+        // aren't any preferred formats, so we pick
+        data->surfaceFormat.colorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
+        data->surfaceFormat.format = VK_FORMAT_R8G8B8A8_UNORM;
+    } else {
+        data->surfaceFormat = data->surfaceFormats[0];
+        for (uint32_t i = 0; i < data->surfaceFormatsCount; i++) {
+            if (data->surfaceFormats[i].format == VK_FORMAT_R8G8B8A8_UNORM) {
+                data->surfaceFormat = data->surfaceFormats[i];
+                break;
+            }
+        }
+    }
+
+    data->swapchainSize.width = SDL_clamp((uint32_t)w,
+                                          data->surfaceCapabilities.minImageExtent.width,
+                                          data->surfaceCapabilities.maxImageExtent.width);
+
+    data->swapchainSize.height = SDL_clamp((uint32_t)h,
+                                           data->surfaceCapabilities.minImageExtent.height,
+                                           data->surfaceCapabilities.maxImageExtent.height);
+
+
+    VkSwapchainCreateInfoKHR swapchainCreateInfo = { 0 };
+    swapchainCreateInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    swapchainCreateInfo.surface = data->surface;
+    swapchainCreateInfo.minImageCount = data->swapchainDesiredImageCount;
+    swapchainCreateInfo.imageFormat = data->surfaceFormat.format;
+    swapchainCreateInfo.imageColorSpace = data->surfaceFormat.colorSpace;
+    swapchainCreateInfo.imageExtent = data->swapchainSize;
+    swapchainCreateInfo.imageArrayLayers = 1;
+    swapchainCreateInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    swapchainCreateInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    swapchainCreateInfo.preTransform = data->surfaceCapabilities.currentTransform;
+    //TODO
+#if 0
+    if (flags & SDL_WINDOW_TRANSPARENT) {
+        createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+    } else 
+#endif
+    {
+        swapchainCreateInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    }
+    swapchainCreateInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR; // TODO
+    swapchainCreateInfo.clipped = VK_TRUE;
+    swapchainCreateInfo.oldSwapchain = data->swapchain;
+    result = vkCreateSwapchainKHR(data->device, &swapchainCreateInfo, NULL, &data->swapchain);
+
+    if (swapchainCreateInfo.oldSwapchain != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(data->device, swapchainCreateInfo.oldSwapchain, NULL);
+    }
+
+    if (result != VK_SUCCESS) {
+        data->swapchain = VK_NULL_HANDLE;
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateSwapchainKHR(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+
+    SDL_free(data->swapchainImages);
+    data->swapchainImages = NULL;
+    result = vkGetSwapchainImagesKHR(data->device, data->swapchain, &data->swapchainImageCount, NULL);
+    if (result != VK_SUCCESS) {
+        data->swapchainImageCount = 0;
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkGetSwapchainImagesKHR(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+
+    data->swapchainImages = SDL_malloc(sizeof(VkImage) * data->swapchainImageCount);
+    result = vkGetSwapchainImagesKHR(data->device,
+                                     data->swapchain,
+                                     &data->swapchainImageCount,
+                                     data->swapchainImages);
+    if (result != VK_SUCCESS) {
+        SDL_free(data->swapchainImages);
+        data->swapchainImages = NULL;
+        data->swapchainImageCount = 0;
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkGetSwapchainImagesKHR(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+    
+#if D3D12_PORT
+    
 
     /* Create a swap chain using the same adapter as the existing Direct3D device. */
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc;
@@ -1469,14 +1281,11 @@ VkResult VULKAN_HandleDeviceLost(SDL_Renderer *renderer)
 /* Initialize all resources that change when the window's size changes. */
 static VkResult VULKAN_CreateWindowSizeDependentResources(SDL_Renderer *renderer)
 {
-#if D3D12_PORT
     VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
-    HRESULT result = S_OK;
+    VkResult result = VK_SUCCESS;
     int i, w, h;
 
-    VULKAN_RENDER_TARGET_VIEW_DESC rtvDesc;
-    VULKAN_CPU_DESCRIPTOR_HANDLE rtvDescriptor;
-
+#if D3D12_PORT
     /* Release resources in the current command list */
     VULKAN_IssueBatch(data);
     D3D_CALL(data->commandList, OMSetRenderTargets, 0, NULL, FALSE, NULL);
@@ -1485,45 +1294,25 @@ static VkResult VULKAN_CreateWindowSizeDependentResources(SDL_Renderer *renderer
     for (i = 0; i < SDL_VULKAN_NUM_BUFFERS; ++i) {
         SAFE_RELEASE(data->renderTargets[i]);
     }
+#endif
 
     /* The width and height of the swap chain must be based on the display's
      * non-rotated size.
      */
     SDL_GetWindowSizeInPixels(renderer->window, &w, &h);
+
+#if D3D12_PORT
     data->rotation = VULKAN_GetCurrentRotation();
     if (VULKAN_IsDisplayRotated90Degrees(data->rotation)) {
         int tmp = w;
         w = h;
         h = tmp;
     }
+#endif
 
-#if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
-    if (data->swapChain) {
-        /* If the swap chain already exists, resize it. */
-        result = D3D_CALL(data->swapChain, ResizeBuffers,
-                          0,
-                          w, h,
-                          DXGI_FORMAT_UNKNOWN,
-                          data->swapFlags);
-        if (result == DXGI_ERROR_DEVICE_REMOVED) {
-            /* If the device was removed for any reason, a new device and swap chain will need to be created. */
-            VULKAN_HandleDeviceLost(renderer);
-
-            /* Everything is set up now. Do not continue execution of this method. HandleDeviceLost will reenter this method
-             * and correctly set up the new device.
-             */
-            goto done;
-        } else if (FAILED(result)) {
-            WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IDXGISwapChain::ResizeBuffers"), result);
-            goto done;
-        }
-    } else {
-        result = VULKAN_CreateSwapChain(renderer, w, h);
-        if (FAILED(result) || !data->swapChain) {
-            goto done;
-        }
-    }
-
+    result = VULKAN_CreateSwapChain(renderer, w, h);
+    
+#if D3D12_PORT
     /* Set the proper rotation for the swap chain. */
     if (WIN_IsWindows8OrGreater()) {
         if (data->swapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) {
@@ -1534,7 +1323,6 @@ static VkResult VULKAN_CreateWindowSizeDependentResources(SDL_Renderer *renderer
             }
         }
     }
-#endif /*!defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)*/
 
     /* Get each back buffer render target and create render target views */
     for (i = 0; i < SDL_VULKAN_NUM_BUFFERS; ++i) {
@@ -2361,7 +2149,7 @@ static int VULKAN_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd
     }
 
     cmd->data.draw.count = count;
-
+#if D3D12_PORT
     for (i = 0; i < count; i++) {
         verts->pos.x = points[i].x + 0.5f;
         verts->pos.y = points[i].y + 0.5f;
@@ -2370,7 +2158,7 @@ static int VULKAN_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd
         verts->color = cmd->data.draw.color;
         verts++;
     }
-
+#endif
     return 0;
 }
 
@@ -2405,6 +2193,7 @@ static int VULKAN_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
 
         xy_ = (float *)((char *)xy + j * xy_stride);
 
+#if D3D12_PORT
         verts->pos.x = xy_[0] * scale_x;
         verts->pos.y = xy_[1] * scale_y;
         verts->color = *(SDL_FColor *)((char *)color + j * color_stride);
@@ -2417,7 +2206,7 @@ static int VULKAN_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
             verts->tex.x = 0.0f;
             verts->tex.y = 0.0f;
         }
-
+#endif
         verts += 1;
     }
     return 0;
@@ -2713,9 +2502,9 @@ static int VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderCommand *
 }
 #endif
 
+#if D3D12_PORT
 static int VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderCommand *cmd, const Float4X4 *matrix)
 {
-#if D3D12_PORT
     SDL_Texture *texture = cmd->data.draw.texture;
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
     VULKAN_TextureData *textureData = (VULKAN_TextureData *)texture->driverdata;
@@ -2797,8 +2586,8 @@ static int VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderCommand *
     textureData->mainResourceState = VULKAN_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     return VULKAN_SetDrawState(renderer, cmd, SHADER_RGB, VULKAN_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, 1, &textureData->mainTextureResourceView,
                               textureSampler, matrix);
-#endif
 }
+#endif
 
 #if D3D12_PORT
 static void VULKAN_DrawPrimitives(SDL_Renderer *renderer, VULKAN_PRIMITIVE_TOPOLOGY primitiveTopology, const size_t vertexStart, const size_t vertexCount)
