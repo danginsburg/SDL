@@ -193,6 +193,8 @@ typedef struct
     VkPhysicalDevice physicalDevice;
     VkPhysicalDeviceProperties physicalDeviceProperties;
     VkPhysicalDeviceFeatures physicalDeviceFeatures;
+    VkQueue graphicsQueue;
+    VkQueue presentQueue;
     VkDevice device;
     uint32_t graphicsQueueFamilyIndex;
     uint32_t presentQueueFamilyIndex;
@@ -200,6 +202,8 @@ typedef struct
     uint32_t numSwapchainImages;
     VkCommandPool commandPool;
     VkCommandBuffer commandBuffers[SDL_VULKAN_NUM_BUFFERS];
+    uint32_t currentCommandBufferIndex;
+    VkCommandBuffer currentCommandBuffer;
     VkFence fences[SDL_VULKAN_NUM_BUFFERS];
     VkSurfaceCapabilitiesKHR surfaceCapabilities;
     VkSurfaceFormatKHR *surfaceFormats;
@@ -211,75 +215,19 @@ typedef struct
     uint32_t swapchainImageCount;
     VkImage *swapchainImages;
     VkSemaphore imageAvailableSemaphore;
-
-#if D3D12_PORT
-    IVULKANDevice1 *d3dDevice;
-    IVULKANDebug *debugInterface;
-    IVULKANCommandQueue *commandQueue;
-    IVULKANGraphicsCommandList2 *commandList;
-    DXGI_SWAP_EFFECT swapEffect;
-    UINT swapFlags;
-    DXGI_FORMAT renderTargetFormat;
-    SDL_bool pixelSizeChanged;
-
-    /* Descriptor heaps */
-    IVULKANDescriptorHeap *rtvDescriptorHeap;
-    UINT rtvDescriptorSize;
-    IVULKANDescriptorHeap *textureRTVDescriptorHeap;
-    IVULKANDescriptorHeap *srvDescriptorHeap;
-    UINT srvDescriptorSize;
-    IVULKANDescriptorHeap *samplerDescriptorHeap;
-    UINT samplerDescriptorSize;
-
-    /* Data needed per backbuffer */
-    IVULKANCommandAllocator *commandAllocators[SDL_VULKAN_NUM_BUFFERS];
-    IVULKANResource *renderTargets[SDL_VULKAN_NUM_BUFFERS];
-    UINT64 fenceValue;
-    int currentBackBufferIndex;
-
-    /* Fences */
-    IVULKANFence *fence;
-    HANDLE fenceEvent;
-
-    /* Root signature and pipeline state data */
-    IVULKANRootSignature *rootSignatures[NUM_ROOTSIGS];
-    int pipelineStateCount;
-    VULKAN_PipelineState *pipelineStates;
-    VULKAN_PipelineState *currentPipelineState;
-
-    VULKAN_VertexBuffer vertexBuffers[SDL_VULKAN_NUM_VERTEX_BUFFERS];
-    VULKAN_CPU_DESCRIPTOR_HANDLE nearestPixelSampler;
-    VULKAN_CPU_DESCRIPTOR_HANDLE linearSampler;
-
-    /* Data for staging/allocating textures */
-    IVULKANResource *uploadBuffers[SDL_VULKAN_NUM_UPLOAD_BUFFERS];
-    int currentUploadBuffer;
-
-    /* Pool allocator to handle reusing SRV heap indices */
-    VULKAN_SRVPoolNode *srvPoolHead;
-    VULKAN_SRVPoolNode srvPoolNodes[SDL_VULKAN_MAX_NUM_TEXTURES];
-
-    /* Vertex buffer constants */
-    VertexShaderConstants vertexShaderConstantsData;
-
+    uint32_t currentSwapchainImageIndex;
+    
     /* Cached renderer properties */
-    DXGI_MODE_ROTATION rotation;
-    VULKAN_TextureData *textureRenderTarget;
-    VULKAN_CPU_DESCRIPTOR_HANDLE currentRenderTargetView;
-    VULKAN_CPU_DESCRIPTOR_HANDLE currentShaderResource;
-    VULKAN_CPU_DESCRIPTOR_HANDLE currentSampler;
     SDL_bool cliprectDirty;
     SDL_bool currentCliprectEnabled;
     SDL_Rect currentCliprect;
     SDL_Rect currentViewport;
     int currentViewportRotation;
     SDL_bool viewportDirty;
-    Float4X4 identity;
     int currentVertexBuffer;
     SDL_bool issueBatch;
-#else
-    int port;
-#endif
+
+
 } VULKAN_RenderData;
 
 
@@ -340,6 +288,39 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
     }
 }
 
+static SDL_bool VULKAN_ActivateCommandBuffer(SDL_Renderer *renderer, VkAttachmentLoadOp loadOp, VkClearColorValue *clearColor)
+{
+    VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
+
+    /* Our SetRenderTarget just signals that the next render operation should
+     * set up a new render pass. This is where that work happens. */
+    if (data->currentCommandBuffer == VK_NULL_HANDLE) {
+
+        // TODO: Probably doesn't belong here
+        VkResult result;
+        
+        result = vkAcquireNextImageKHR(data->device, data->swapchain, UINT64_MAX,
+                                      data->imageAvailableSemaphore, VK_NULL_HANDLE, &data->currentSwapchainImageIndex);
+        if (result != VK_SUCCESS) {
+            // TODO: Handle out-of-date, suboptimal, etc.
+            return SDL_FALSE;
+        }
+
+        data->currentCommandBuffer = data->commandBuffers[data->currentCommandBufferIndex];
+        data->currentCommandBufferIndex = ( data->currentCommandBufferIndex + 1 ) % SDL_VULKAN_NUM_BUFFERS;
+        
+        vkResetCommandBuffer(data->currentCommandBuffer, 0);
+
+        VkCommandBufferBeginInfo beginInfo = { 0 };
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = 0;
+        vkBeginCommandBuffer(data->currentCommandBuffer, &beginInfo);
+        
+        // TODO: handle renderpasses, framebuffers
+    }
+
+    return SDL_TRUE;
+}
 
 static void VULKAN_WaitForGPU(VULKAN_RenderData *data)
 {
@@ -922,6 +903,14 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
     if(VULKAN_LoadDeviceFunctions(data) != 0) {
         VULKAN_DestroyAll(renderer);
         return VK_ERROR_UNKNOWN;
+    }
+    
+    /* Get graphics/present queues */
+    vkGetDeviceQueue(data->device, data->graphicsQueueFamilyIndex, 0, &data->graphicsQueue);
+    if (data->graphicsQueueFamilyIndex != data->presentQueueFamilyIndex) {
+        vkGetDeviceQueue(data->device, data->presentQueueFamilyIndex, 0, &data->presentQueue);
+    } else {
+        data->presentQueue = data->graphicsQueue;
     }
     
     /* Create command pool/command buffers */
@@ -2613,8 +2602,9 @@ static void VULKAN_InvalidateCachedState(SDL_Renderer *renderer)
 
 static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
 {
-#if D3D12_PORT
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
+
+#if D3D12_PORT
     const int viewportRotation = VULKAN_GetRotationForCurrentRenderTarget(renderer);
 
     if (rendererData->pixelSizeChanged) {
@@ -2628,6 +2618,10 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
     }
 
     if (VULKAN_UpdateVertexBuffer(renderer, vertices, vertsize) < 0) {
+        return -1;
+    }
+#endif
+    if (!VULKAN_ActivateCommandBuffer(renderer, VK_ATTACHMENT_LOAD_OP_LOAD, NULL)) {
         return -1;
     }
 
@@ -2674,23 +2668,42 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
 
         case SDL_RENDERCMD_CLEAR:
         {
-            VULKAN_CPU_DESCRIPTOR_HANDLE rtvDescriptor = VULKAN_GetCurrentRenderTargetView(renderer);
-            D3D_CALL(rendererData->commandList, ClearRenderTargetView, rtvDescriptor, &cmd->data.color.color.r, 0, NULL);
+            VkClearColorValue clearColor;
+            VkImageSubresourceRange clearRange = { 0 };
+            clearRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            clearRange.baseMipLevel = 0;
+            clearRange.levelCount = 1;
+            clearRange.baseArrayLayer = 0;
+            clearRange.layerCount = 1;
+
+            clearColor.float32[0] = cmd->data.color.color.r;
+            clearColor.float32[1] = cmd->data.color.color.g;
+            clearColor.float32[2] = cmd->data.color.color.b;
+            clearColor.float32[3] = cmd->data.color.color.a;
+            vkCmdClearColorImage(rendererData->currentCommandBuffer,
+                                 rendererData->swapchainImages[rendererData->currentSwapchainImageIndex],
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 &clearColor,
+                                 1,
+                                 &clearRange);
             break;
         }
 
         case SDL_RENDERCMD_DRAW_POINTS:
         {
+#if D3D12_PORT
             const size_t count = cmd->data.draw.count;
             const size_t first = cmd->data.draw.first;
             const size_t start = first / sizeof(VertexPositionColor);
             VULKAN_SetDrawState(renderer, cmd, SHADER_SOLID, VULKAN_PRIMITIVE_TOPOLOGY_TYPE_POINT, 0, NULL, NULL, NULL);
             VULKAN_DrawPrimitives(renderer, D3D_PRIMITIVE_TOPOLOGY_POINTLIST, start, count);
+#endif
             break;
         }
 
         case SDL_RENDERCMD_DRAW_LINES:
         {
+#if D3D12_PORT
             const size_t count = cmd->data.draw.count;
             const size_t first = cmd->data.draw.first;
             const size_t start = first / sizeof(VertexPositionColor);
@@ -2700,6 +2713,7 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
             if (verts[0].pos.x != verts[count - 1].pos.x || verts[0].pos.y != verts[count - 1].pos.y) {
                 VULKAN_DrawPrimitives(renderer, D3D_PRIMITIVE_TOPOLOGY_POINTLIST, start + (count - 1), 1);
             }
+#endif
             break;
         }
 
@@ -2714,6 +2728,7 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
 
         case SDL_RENDERCMD_GEOMETRY:
         {
+#if D3D12_PORT
             SDL_Texture *texture = cmd->data.draw.texture;
             const size_t count = cmd->data.draw.count;
             const size_t first = cmd->data.draw.first;
@@ -2726,6 +2741,7 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
             }
 
             VULKAN_DrawPrimitives(renderer, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, start, count);
+#endif
             break;
         }
 
@@ -2735,7 +2751,6 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
 
         cmd = cmd->next;
     }
-#endif
     return 0;
 }
 
@@ -2904,88 +2919,43 @@ done:
 
 static int VULKAN_RenderPresent(SDL_Renderer *renderer)
 {
-#if D3D12_PORT
     VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
-#if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
-    UINT syncInterval;
-    UINT presentFlags;
-#endif
-    HRESULT result;
+    VkResult result = VK_SUCCESS;
+    if (data->currentCommandBuffer) {
+        vkEndCommandBuffer(data->currentCommandBuffer);
+        
+        VkSubmitInfo submitInfo = { 0 };
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        //submitInfo.waitSemaphoreCount = 1;
+        //submitInfo.pWaitSemaphores = &vulkanContext->imageAvailableSemaphore;
+        //submitInfo.pWaitDstStageMask = &waitDestStageMask;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &data->currentCommandBuffer;
+        //submitInfo.signalSemaphoreCount = 1;
+        //submitInfo.pSignalSemaphores = &vulkanContext->renderingFinishedSemaphore;
+        result = vkQueueSubmit(data->graphicsQueue, 1, &submitInfo, NULL); // TODO-  fence data->fences[frameIndex]);
+        
+        data->currentCommandBuffer = VK_NULL_HANDLE;
+        
+        //TODO - this it temporary
+        vkDeviceWaitIdle(data->device);
+        
+        VkPresentInfoKHR presentInfo = { 0 };
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        //presentInfo.waitSemaphoreCount = 1;
+        //presentInfo.pWaitSemaphores = &vulkanContext->renderingFinishedSemaphore;
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = &data->swapchain;
+        presentInfo.pImageIndices = &data->currentSwapchainImageIndex;
+        result = vkQueuePresentKHR(data->presentQueue, &presentInfo);
+        // TODO: Handle this
+        
+        //TODO - this it temporary
+        vkDeviceWaitIdle(data->device);
 
-    /* Transition the render target to present state */
-    VULKAN_TransitionResource(data,
-                             data->renderTargets[data->currentBackBufferIndex],
-                             VULKAN_RESOURCE_STATE_RENDER_TARGET,
-                             VULKAN_RESOURCE_STATE_PRESENT);
-
-    /* Issue the command list */
-    result = D3D_CALL(data->commandList, Close);
-    D3D_CALL(data->commandQueue, ExecuteCommandLists, 1, (IVULKANCommandList *const *)&data->commandList);
-
-#if defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES)
-    result = VULKAN_XBOX_PresentFrame(data->commandQueue, data->frameToken, data->renderTargets[data->currentBackBufferIndex]);
-#else
-    if (renderer->info.flags & SDL_RENDERER_PRESENTVSYNC) {
-        syncInterval = 1;
-        presentFlags = 0;
-    } else {
-        syncInterval = 0;
-        presentFlags = DXGI_PRESENT_ALLOW_TEARING;
     }
-
-    /* The application may optionally specify "dirty" or "scroll"
-     * rects to improve efficiency in certain scenarios.
-     */
-    result = D3D_CALL(data->swapChain, Present, syncInterval, presentFlags);
-#endif
-
-    if (FAILED(result) && result != DXGI_ERROR_WAS_STILL_DRAWING) {
-        /* If the device was removed either by a disconnect or a driver upgrade, we
-         * must recreate all device resources.
-         */
-        if (result == DXGI_ERROR_DEVICE_REMOVED) {
-            VULKAN_HandleDeviceLost(renderer);
-        } else if (result == DXGI_ERROR_INVALID_CALL) {
-            /* We probably went through a fullscreen <-> windowed transition */
-            VULKAN_CreateWindowSizeDependentResources(renderer);
-        } else {
-            WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IDXGISwapChain::Present"), result);
-        }
-        return -1;
-    } else {
-        /* Wait for the GPU and move to the next frame */
-        result = D3D_CALL(data->commandQueue, Signal, data->fence, data->fenceValue);
-
-        if (D3D_CALL(data->fence, GetCompletedValue) < data->fenceValue) {
-            result = D3D_CALL(data->fence, SetEventOnCompletion,
-                              data->fenceValue,
-                              data->fenceEvent);
-            WaitForSingleObjectEx(data->fenceEvent, INFINITE, FALSE);
-        }
-
-        data->fenceValue++;
-#if defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES)
-        data->currentBackBufferIndex++;
-        data->currentBackBufferIndex %= SDL_VULKAN_NUM_BUFFERS;
-#else
-        data->currentBackBufferIndex = D3D_CALL(data->swapChain, GetCurrentBackBufferIndex);
-#endif
-
-        /* Reset the command allocator and command list, and transition back to render target */
-        VULKAN_ResetCommandList(data);
-        VULKAN_TransitionResource(data,
-                                 data->renderTargets[data->currentBackBufferIndex],
-                                 VULKAN_RESOURCE_STATE_PRESENT,
-                                 VULKAN_RESOURCE_STATE_RENDER_TARGET);
-
-#if defined(SDL_PLATFORM_XBOXONE) || defined(SDL_PLATFORM_XBOXSERIES)
-        VULKAN_XBOX_StartFrame(data->d3dDevice, &data->frameToken);
-#endif
-        return 0;
-    }
-#else
-    return 0;
-#endif
+    
+    return (result == VK_SUCCESS);
 }
 
 static int VULKAN_SetVSync(SDL_Renderer *renderer, const int vsync)
