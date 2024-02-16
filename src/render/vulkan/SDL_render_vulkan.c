@@ -37,6 +37,7 @@ typedef enum {
 
 #define VK_NO_PROTOTYPES
 #include "SDL_vulkan.h"
+#include "SDL_shaders_vulkan.h"
 #include <vulkan/vulkan.h>
 #include "../SDL_sysrender.h"
 #include "../SDL_sysvideo.h"
@@ -52,19 +53,27 @@ extern const char *SDL_Vulkan_GetResultString(VkResult result);
     VULKAN_DEVICE_FUNCTION(vkCmdEndRenderPass)                          \
     VULKAN_DEVICE_FUNCTION(vkCmdPipelineBarrier)                        \
     VULKAN_DEVICE_FUNCTION(vkCreateCommandPool)                         \
+    VULKAN_DEVICE_FUNCTION(vkCreateDescriptorSetLayout)                 \
     VULKAN_DEVICE_FUNCTION(vkCreateFence)                               \
     VULKAN_DEVICE_FUNCTION(vkCreateFramebuffer)                         \
+    VULKAN_DEVICE_FUNCTION(vkCreateGraphicsPipelines)                   \
     VULKAN_DEVICE_FUNCTION(vkCreateImageView)                           \
+    VULKAN_DEVICE_FUNCTION(vkCreatePipelineLayout)                      \
     VULKAN_DEVICE_FUNCTION(vkCreateRenderPass)                          \
     VULKAN_DEVICE_FUNCTION(vkCreateSemaphore)                           \
+    VULKAN_DEVICE_FUNCTION(vkCreateShaderModule)                        \
     VULKAN_DEVICE_FUNCTION(vkCreateSwapchainKHR)                        \
     VULKAN_DEVICE_FUNCTION(vkDestroyCommandPool)                        \
     VULKAN_DEVICE_FUNCTION(vkDestroyDevice)                             \
+    VULKAN_DEVICE_FUNCTION(vkDestroyDescriptorSetLayout)                \
     VULKAN_DEVICE_FUNCTION(vkDestroyFence)                              \
     VULKAN_DEVICE_FUNCTION(vkDestroyFramebuffer)                        \
     VULKAN_DEVICE_FUNCTION(vkDestroyImageView)                          \
+    VULKAN_DEVICE_FUNCTION(vkDestroyPipeline)                           \
+    VULKAN_DEVICE_FUNCTION(vkDestroyPipelineLayout)                     \
     VULKAN_DEVICE_FUNCTION(vkDestroyRenderPass)                         \
     VULKAN_DEVICE_FUNCTION(vkDestroySemaphore)                          \
+    VULKAN_DEVICE_FUNCTION(vkDestroyShaderModule)                       \
     VULKAN_DEVICE_FUNCTION(vkDestroySwapchainKHR)                       \
     VULKAN_DEVICE_FUNCTION(vkDeviceWaitIdle)                            \
     VULKAN_DEVICE_FUNCTION(vkEndCommandBuffer)                          \
@@ -161,15 +170,11 @@ typedef struct
 /* Pipeline State Object data */
 typedef struct
 {
-#if D3D12_PORT
     VULKAN_Shader shader;
     SDL_BlendMode blendMode;
-    VULKAN_PRIMITIVE_TOPOLOGY_TYPE topology;
-    DXGI_FORMAT rtvFormat;
-    IVULKANPipelineState *pipelineState;
-#else
-    int port;
-#endif
+    VkPrimitiveTopology topology;
+    VkFormat format;
+    VkPipeline pipeline;
 } VULKAN_PipelineState;
 
 /* Vertex Buffer */
@@ -222,6 +227,13 @@ typedef struct
     VkFramebuffer *framebuffers;
     VkRenderPass renderPasses[SDL_VULKAN_NUM_RENDERPASSES];
     VkRenderPass currentRenderPass;
+
+    VkShaderModule vertexShaderModules[NUM_SHADERS];
+    VkShaderModule fragmentShaderModules[NUM_SHADERS];
+
+    int pipelineStateCount;
+    VULKAN_PipelineState *pipelineStates;
+    VULKAN_PipelineState *currentPipelineState;
 
     uint32_t surfaceFormatsAllocatedCount;
     uint32_t surfaceFormatsCount;
@@ -306,7 +318,7 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
         SDL_free(data->framebuffers);
         data->framebuffers = NULL;
     }
-    for (int i = 0; i < SDL_VULKAN_NUM_RENDERPASSES; i++) {
+    for (uint32_t i = 0; i < SDL_VULKAN_NUM_RENDERPASSES; i++) {
         if (data->renderPasses[i] != VK_NULL_HANDLE) {
             vkDestroyRenderPass(data->device, data->renderPasses[i], NULL);
             data->renderPasses[i] = VK_NULL_HANDLE;
@@ -325,6 +337,17 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
         vkDestroyCommandPool(data->device, data->commandPool, NULL);
         data->commandPool = VK_NULL_HANDLE;
     }
+    for (uint32_t i = 0; i < NUM_SHADERS; i++) {
+        if (data->vertexShaderModules[i] != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(data->device, data->vertexShaderModules[i], NULL);
+            data->vertexShaderModules[i] = VK_NULL_HANDLE;
+        }
+        if (data->fragmentShaderModules[i] != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(data->device, data->fragmentShaderModules[i], NULL);
+            data->fragmentShaderModules[i] = VK_NULL_HANDLE;
+        }
+    }
+
     if (data->device != VK_NULL_HANDLE) {
         vkDestroyDevice(data->device, NULL);
         data->device = VK_NULL_HANDLE;
@@ -524,100 +547,196 @@ static void VULKAN_DestroyRenderer(SDL_Renderer *renderer)
     SDL_free(renderer);
 }
 
-#if D3D12_PORT
-
-static void VULKAN_CreateBlendState(SDL_Renderer *renderer, SDL_BlendMode blendMode, VULKAN_BLEND_DESC *outBlendDesc)
+static VkBlendFactor GetBlendFactor(SDL_BlendFactor factor)
 {
-    SDL_BlendFactor srcColorFactor = SDL_GetBlendModeSrcColorFactor(blendMode);
-    SDL_BlendFactor srcAlphaFactor = SDL_GetBlendModeSrcAlphaFactor(blendMode);
-    SDL_BlendOperation colorOperation = SDL_GetBlendModeColorOperation(blendMode);
-    SDL_BlendFactor dstColorFactor = SDL_GetBlendModeDstColorFactor(blendMode);
-    SDL_BlendFactor dstAlphaFactor = SDL_GetBlendModeDstAlphaFactor(blendMode);
-    SDL_BlendOperation alphaOperation = SDL_GetBlendModeAlphaOperation(blendMode);
-
-    SDL_zerop(outBlendDesc);
-    outBlendDesc->AlphaToCoverageEnable = FALSE;
-    outBlendDesc->IndependentBlendEnable = FALSE;
-    outBlendDesc->RenderTarget[0].BlendEnable = TRUE;
-    outBlendDesc->RenderTarget[0].SrcBlend = GetBlendFunc(srcColorFactor);
-    outBlendDesc->RenderTarget[0].DestBlend = GetBlendFunc(dstColorFactor);
-    outBlendDesc->RenderTarget[0].BlendOp = GetBlendEquation(colorOperation);
-    outBlendDesc->RenderTarget[0].SrcBlendAlpha = GetBlendFunc(srcAlphaFactor);
-    outBlendDesc->RenderTarget[0].DestBlendAlpha = GetBlendFunc(dstAlphaFactor);
-    outBlendDesc->RenderTarget[0].BlendOpAlpha = GetBlendEquation(alphaOperation);
-    outBlendDesc->RenderTarget[0].RenderTargetWriteMask = VULKAN_COLOR_WRITE_ENABLE_ALL;
+    switch (factor) {
+    case SDL_BLENDFACTOR_ZERO:
+        return VK_BLEND_FACTOR_ZERO;
+    case SDL_BLENDFACTOR_ONE:
+        return VK_BLEND_FACTOR_ONE;
+    case SDL_BLENDFACTOR_SRC_COLOR:
+        return VK_BLEND_FACTOR_SRC_COLOR;
+    case SDL_BLENDFACTOR_ONE_MINUS_SRC_COLOR:
+        return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case SDL_BLENDFACTOR_SRC_ALPHA:
+        return VK_BLEND_FACTOR_SRC_ALPHA;
+    case SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA:
+        return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case SDL_BLENDFACTOR_DST_COLOR:
+        return VK_BLEND_FACTOR_DST_COLOR;
+    case SDL_BLENDFACTOR_ONE_MINUS_DST_COLOR:
+        return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case SDL_BLENDFACTOR_DST_ALPHA:
+        return VK_BLEND_FACTOR_DST_ALPHA;
+    case SDL_BLENDFACTOR_ONE_MINUS_DST_ALPHA:
+        return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    default:
+        return VK_BLEND_FACTOR_ZERO;
+    }
 }
 
-static VULKAN_PipelineState *VULKAN_CreatePipelineState(SDL_Renderer *renderer,
-                                                      VULKAN_Shader shader,
-                                                      SDL_BlendMode blendMode,
-                                                      VULKAN_PRIMITIVE_TOPOLOGY_TYPE topology,
-                                                      DXGI_FORMAT rtvFormat)
+static VkBlendOp GetBlendOp(SDL_BlendOperation operation)
 {
-    const VULKAN_INPUT_ELEMENT_DESC vertexDesc[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, VULKAN_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, VULKAN_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, VULKAN_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-    };
+    switch (operation) {
+    case SDL_BLENDOPERATION_ADD:
+        return VK_BLEND_OP_ADD;
+    case SDL_BLENDOPERATION_SUBTRACT:
+        return VK_BLEND_OP_SUBTRACT;
+    case SDL_BLENDOPERATION_REV_SUBTRACT:
+        return VK_BLEND_OP_REVERSE_SUBTRACT;
+    case SDL_BLENDOPERATION_MINIMUM:
+        return VK_BLEND_OP_MIN;
+    case SDL_BLENDOPERATION_MAXIMUM:
+        return VK_BLEND_OP_MAX;
+    default:
+        return VK_BLEND_OP_ADD;
+    }
+}
+
+
+static VULKAN_PipelineState *VULKAN_CreatePipelineState(SDL_Renderer *renderer,
+    VULKAN_Shader shader, SDL_BlendMode blendMode, VkPrimitiveTopology topology, VkFormat format)
+{
     VULKAN_RenderData *data = (VULKAN_RenderData *)renderer->driverdata;
-    VULKAN_GRAPHICS_PIPELINE_STATE_DESC pipelineDesc;
-    IVULKANPipelineState *pipelineState = NULL;
     VULKAN_PipelineState *pipelineStates;
-    HRESULT result = S_OK;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkResult result = VK_SUCCESS;
+    VkPipelineVertexInputStateCreateInfo vertexInputCreateInfo = { 0 };
+    VkPipelineInputAssemblyStateCreateInfo inputAssemblyStateCreateInfo = { 0 };
+    VkVertexInputAttributeDescription attributeDescriptions[3];
+    VkVertexInputBindingDescription bindingDescriptions[1];
+    VkPipelineShaderStageCreateInfo shaderStageCreateInfo[2];
+    VkPipelineDynamicStateCreateInfo dynamicStateCreateInfo = { 0 };
+    VkPipelineViewportStateCreateInfo viewportStateCreateInfo = { 0 };
+    VkPipelineRasterizationStateCreateInfo rasterizationStateCreateInfo = { 0 };
+    VkPipelineMultisampleStateCreateInfo multisampleStateCreateInfo = { 0 };
+    VkPipelineDepthStencilStateCreateInfo depthStencilStateCreateInfo = { 0 };
+    VkPipelineColorBlendStateCreateInfo colorBlendStateCreateInfo = { 0 };
 
-    SDL_zero(pipelineDesc);
-    pipelineDesc.pRootSignature = data->rootSignatures[VULKAN_GetRootSignatureType(shader)];
-    VULKAN_GetVertexShader(shader, &pipelineDesc.VS);
-    VULKAN_GetPixelShader(shader, &pipelineDesc.PS);
-    VULKAN_CreateBlendState(renderer, blendMode, &pipelineDesc.BlendState);
-    pipelineDesc.SampleMask = 0xffffffff;
+    VkGraphicsPipelineCreateInfo pipelineCreateInfo = { 0 };
+    pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineCreateInfo.flags = 0;
+    pipelineCreateInfo.pStages = shaderStageCreateInfo;
+    pipelineCreateInfo.pVertexInputState = &vertexInputCreateInfo;
+    pipelineCreateInfo.pInputAssemblyState = &inputAssemblyStateCreateInfo;
+    pipelineCreateInfo.pViewportState = &viewportStateCreateInfo;
+    pipelineCreateInfo.pRasterizationState = &rasterizationStateCreateInfo;
+    pipelineCreateInfo.pMultisampleState = &multisampleStateCreateInfo;
+    pipelineCreateInfo.pDepthStencilState = &depthStencilStateCreateInfo;
+    pipelineCreateInfo.pColorBlendState = &colorBlendStateCreateInfo;
+    pipelineCreateInfo.pDynamicState = &dynamicStateCreateInfo;
 
-    pipelineDesc.RasterizerState.AntialiasedLineEnable = FALSE;
-    pipelineDesc.RasterizerState.CullMode = VULKAN_CULL_MODE_NONE;
-    pipelineDesc.RasterizerState.DepthBias = 0;
-    pipelineDesc.RasterizerState.DepthBiasClamp = 0.0f;
-    pipelineDesc.RasterizerState.DepthClipEnable = TRUE;
-    pipelineDesc.RasterizerState.FillMode = VULKAN_FILL_MODE_SOLID;
-    pipelineDesc.RasterizerState.FrontCounterClockwise = FALSE;
-    pipelineDesc.RasterizerState.MultisampleEnable = FALSE;
-    pipelineDesc.RasterizerState.SlopeScaledDepthBias = 0.0f;
+    /* Shaders */
+    const char *name = "main";
+    for (uint32_t i = 0; i < 2; i++) {
+        SDL_memset(&shaderStageCreateInfo[i], 0, sizeof(shaderStageCreateInfo[i]));
+        shaderStageCreateInfo[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStageCreateInfo[i].module = (i == 0) ? data->vertexShaderModules[shader] : data->fragmentShaderModules[shader];
+        shaderStageCreateInfo[i].stage = (i == 0) ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+        shaderStageCreateInfo[i].pName = name;
+    }
+    pipelineCreateInfo.stageCount = 2;
+    pipelineCreateInfo.pStages = &shaderStageCreateInfo[0];
 
-    pipelineDesc.InputLayout.pInputElementDescs = vertexDesc;
-    pipelineDesc.InputLayout.NumElements = 3;
 
-    pipelineDesc.PrimitiveTopologyType = topology;
+    /* Vertex input */
+    vertexInputCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInputCreateInfo.vertexAttributeDescriptionCount = 3;
+    vertexInputCreateInfo.pVertexAttributeDescriptions = &attributeDescriptions[0];
+    vertexInputCreateInfo.vertexBindingDescriptionCount = 1;
+    vertexInputCreateInfo.pVertexBindingDescriptions = &bindingDescriptions[0];
 
-    pipelineDesc.NumRenderTargets = 1;
-    pipelineDesc.RTVFormats[0] = rtvFormat;
-    pipelineDesc.SampleDesc.Count = 1;
-    pipelineDesc.SampleDesc.Quality = 0;
+    attributeDescriptions[ 0 ].binding = 0;
+    attributeDescriptions[ 0 ].format = VK_FORMAT_R32G32_SFLOAT;
+    attributeDescriptions[ 0 ].location = 0;
+    attributeDescriptions[ 0 ].offset = 0;
+    attributeDescriptions[ 1 ].binding = 0;
+    attributeDescriptions[ 1 ].format = VK_FORMAT_R32G32_SFLOAT;
+    attributeDescriptions[ 1 ].location = 1;
+    attributeDescriptions[ 1 ].offset = 8;
+    attributeDescriptions[ 2 ].binding = 0;
+    attributeDescriptions[ 2 ].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    attributeDescriptions[ 2 ].location = 2;
+    attributeDescriptions[ 2 ].offset = 16;
 
-    result = D3D_CALL(data->d3dDevice, CreateGraphicsPipelineState,
-                      &pipelineDesc,
-                      D3D_GUID(SDL_IID_IVULKANPipelineState),
-                      (void **)&pipelineState);
-    if (FAILED(result)) {
-        WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateGraphicsPipelineState"), result);
+    bindingDescriptions[ 0 ].binding = 0;
+    bindingDescriptions[ 0 ].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    bindingDescriptions[ 0 ].stride = 32;
+
+    /* Input assembly */
+    inputAssemblyStateCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssemblyStateCreateInfo.topology = ( VkPrimitiveTopology ) topology;
+    inputAssemblyStateCreateInfo.primitiveRestartEnable = VK_FALSE;
+
+    viewportStateCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+
+    /* Dynamic states */
+    dynamicStateCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    VkDynamicState dynamicStates[2] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR
+    };
+    dynamicStateCreateInfo.dynamicStateCount = SDL_arraysize(dynamicStates);
+    dynamicStateCreateInfo.pDynamicStates = dynamicStates;
+
+    /* Rasterization state */
+    rasterizationStateCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizationStateCreateInfo.depthClampEnable = VK_FALSE;
+    rasterizationStateCreateInfo.rasterizerDiscardEnable = VK_FALSE;
+    rasterizationStateCreateInfo.cullMode = VK_CULL_MODE_NONE;
+    rasterizationStateCreateInfo.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizationStateCreateInfo.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizationStateCreateInfo.depthBiasEnable = VK_FALSE;
+    rasterizationStateCreateInfo.depthBiasConstantFactor = 0.0f;
+    rasterizationStateCreateInfo.depthBiasClamp = 0.0f;
+    rasterizationStateCreateInfo.depthBiasSlopeFactor = 0.0f;
+    rasterizationStateCreateInfo.lineWidth = 1.0f;
+
+    /* MSAA state */
+    multisampleStateCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    VkSampleMask multiSampleMask = 0xFFFFFFFF;
+    multisampleStateCreateInfo.pSampleMask = &multiSampleMask;
+
+    /* Depth Stencil */
+    depthStencilStateCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+
+    /* Color blend */
+    VkPipelineColorBlendAttachmentState colorBlendAttachment = { 0 };
+    colorBlendStateCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlendStateCreateInfo.attachmentCount = 1;
+    colorBlendStateCreateInfo.pAttachments = &colorBlendAttachment;
+    colorBlendAttachment.blendEnable = VK_TRUE;
+    colorBlendAttachment.srcColorBlendFactor = GetBlendFactor(SDL_GetBlendModeSrcColorFactor(blendMode));
+    colorBlendAttachment.srcAlphaBlendFactor = GetBlendFactor(SDL_GetBlendModeSrcAlphaFactor(blendMode));
+    colorBlendAttachment.colorBlendOp = GetBlendOp(SDL_GetBlendModeColorOperation(blendMode));
+    colorBlendAttachment.dstColorBlendFactor = GetBlendFactor(SDL_GetBlendModeDstColorFactor(blendMode));
+    colorBlendAttachment.dstAlphaBlendFactor = GetBlendFactor(SDL_GetBlendModeDstAlphaFactor(blendMode));
+    colorBlendAttachment.alphaBlendOp = GetBlendOp(SDL_GetBlendModeAlphaOperation(blendMode));
+    colorBlendAttachment.colorWriteMask = 0xFFFFFFFF;
+
+
+    /* Renderpass / layout */
+    pipelineCreateInfo.renderPass = data->currentRenderPass;
+    pipelineCreateInfo.subpass = 0;
+    pipelineCreateInfo.layout = VK_NULL_HANDLE; // TODO
+
+    result = vkCreateGraphicsPipelines(data->device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, NULL, &pipeline);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateGraphicsPipelines(): %s\n", SDL_Vulkan_GetResultString(result));
         return NULL;
     }
 
     pipelineStates = (VULKAN_PipelineState *)SDL_realloc(data->pipelineStates, (data->pipelineStateCount + 1) * sizeof(*pipelineStates));
-    if (!pipelineStates) {
-        SAFE_RELEASE(pipelineState);
-        return NULL;
-    }
-
     pipelineStates[data->pipelineStateCount].shader = shader;
     pipelineStates[data->pipelineStateCount].blendMode = blendMode;
     pipelineStates[data->pipelineStateCount].topology = topology;
-    pipelineStates[data->pipelineStateCount].rtvFormat = rtvFormat;
-    pipelineStates[data->pipelineStateCount].pipelineState = pipelineState;
+    pipelineStates[data->pipelineStateCount].format = format;
+    pipelineStates[data->pipelineStateCount].pipeline = pipeline;
     data->pipelineStates = pipelineStates;
     ++data->pipelineStateCount;
 
     return &pipelineStates[data->pipelineStateCount - 1];
 }
-#endif
 
 static VkResult VULKAN_CreateVertexBuffer(VULKAN_RenderData *data, size_t vbidx, size_t size)
 {
@@ -1058,6 +1177,26 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
     if (VULKAN_GetSurfaceFormats(data) != VK_SUCCESS) {
         VULKAN_DestroyAll(renderer);
         return result;
+    }
+
+    /* Create shaders */
+    for (uint32_t i = 0; i < NUM_SHADERS; i++) {
+        VkShaderModuleCreateInfo shaderModuleCreateInfo = { 0 };
+        shaderModuleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        VULKAN_GetVertexShader(i, &shaderModuleCreateInfo.pCode, &shaderModuleCreateInfo.codeSize);
+        result = vkCreateShaderModule(data->device, &shaderModuleCreateInfo, NULL, &data->vertexShaderModules[i]);
+        if (result != VK_SUCCESS) {
+            VULKAN_DestroyAll(renderer);
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateShaderModule(): %s\n", SDL_Vulkan_GetResultString(result));
+            return result;
+        }
+        VULKAN_GetPixelShader(i, &shaderModuleCreateInfo.pCode, &shaderModuleCreateInfo.codeSize);
+        result = vkCreateShaderModule(data->device, &shaderModuleCreateInfo, NULL, &data->fragmentShaderModules[i]);
+        if (result != VK_SUCCESS) {
+            VULKAN_DestroyAll(renderer);
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateShaderModule(): %s\n", SDL_Vulkan_GetResultString(result));
+            return result;
+        }
     }
 
     return VK_SUCCESS;
