@@ -625,23 +625,17 @@ static void VULKAN_BeginRenderPass(VULKAN_RenderData *rendererData, VkAttachment
 
     VkFramebuffer framebuffer = rendererData->textureRenderTarget ?
         rendererData->textureRenderTarget->mainFramebuffer :
-        rendererData->framebuffers[rendererData->currentCommandBufferIndex];
+        rendererData->framebuffers[rendererData->currentSwapchainImageIndex];
 
     VkRenderPassBeginInfo renderPassBeginInfo = { 0 };
     renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     renderPassBeginInfo.pNext = NULL;
     renderPassBeginInfo.renderPass = rendererData->currentRenderPass;
     renderPassBeginInfo.framebuffer = framebuffer;
-    renderPassBeginInfo.renderArea.offset.x = SDL_max(rendererData->currentViewport.x, 0);
-    renderPassBeginInfo.renderArea.offset.y = SDL_max(rendererData->currentViewport.y, 0);
-    renderPassBeginInfo.renderArea.extent.width = SDL_min(rendererData->currentViewport.w, width);
-    renderPassBeginInfo.renderArea.extent.height = SDL_min(rendererData->currentViewport.h, height);
-    if ( ( renderPassBeginInfo.renderArea.offset.x + renderPassBeginInfo.renderArea.extent.width ) > width ) {
-        renderPassBeginInfo.renderArea.extent.width = SDL_max( 0, width - renderPassBeginInfo.renderArea.offset.x );
-    }
-    if ( ( renderPassBeginInfo.renderArea.offset.y + renderPassBeginInfo.renderArea.extent.height ) > height ) {
-        renderPassBeginInfo.renderArea.extent.height = SDL_max( 0, height - renderPassBeginInfo.renderArea.offset.y );
-    }
+    renderPassBeginInfo.renderArea.offset.x = 0;
+    renderPassBeginInfo.renderArea.offset.y = 0;
+    renderPassBeginInfo.renderArea.extent.width = width;
+    renderPassBeginInfo.renderArea.extent.height = height;
     renderPassBeginInfo.clearValueCount = (clearColor == NULL) ? 0 : 1;
     VkClearValue clearValue;
     if (clearColor != NULL) {
@@ -658,15 +652,15 @@ static void VULKAN_EnsureCommandBuffer(VULKAN_RenderData *rendererData)
         VULKAN_ResetCommandList(rendererData);
 
         /* Ensure the swapchain is in the correct layout */
-        if (rendererData->swapchainImageLayouts[rendererData->currentCommandBufferIndex] == VK_IMAGE_LAYOUT_UNDEFINED) {
+        if (rendererData->swapchainImageLayouts[rendererData->currentSwapchainImageIndex] == VK_IMAGE_LAYOUT_UNDEFINED) {
             VULKAN_RecordPipelineImageBarrier(rendererData,
                 0,
                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                rendererData->swapchainImages[rendererData->currentCommandBufferIndex],
-                &rendererData->swapchainImageLayouts[rendererData->currentCommandBufferIndex]);
+                rendererData->swapchainImages[rendererData->currentSwapchainImageIndex],
+                &rendererData->swapchainImageLayouts[rendererData->currentSwapchainImageIndex]);
         }
         else if (rendererData->swapchainImageLayouts[rendererData->currentCommandBufferIndex] != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
             VULKAN_RecordPipelineImageBarrier(rendererData,
@@ -675,8 +669,8 @@ static void VULKAN_EnsureCommandBuffer(VULKAN_RenderData *rendererData)
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                rendererData->swapchainImages[rendererData->currentCommandBufferIndex],
-                &rendererData->swapchainImageLayouts[rendererData->currentCommandBufferIndex]);
+                rendererData->swapchainImages[rendererData->currentSwapchainImageIndex],
+                &rendererData->swapchainImageLayouts[rendererData->currentSwapchainImageIndex]);
         }
     }
 }
@@ -3214,8 +3208,8 @@ static int VULKAN_RenderPresent(SDL_Renderer *renderer)
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            rendererData->swapchainImages[rendererData->currentCommandBufferIndex],
-            &rendererData->swapchainImageLayouts[rendererData->currentCommandBufferIndex]);
+            rendererData->swapchainImages[rendererData->currentSwapchainImageIndex],
+            &rendererData->swapchainImageLayouts[rendererData->currentSwapchainImageIndex]);
 
         vkEndCommandBuffer(rendererData->currentCommandBuffer);
 
