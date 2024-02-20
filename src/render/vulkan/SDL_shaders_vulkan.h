@@ -31,6 +31,11 @@ typedef enum
 {
     SHADER_SOLID,
     SHADER_RGB,
+#if SDL_HAVE_YUV
+    SHADER_YUV_JPEG,
+    SHADER_YUV_BT601,
+    SHADER_YUV_BT709,
+#endif
     NUM_SHADERS
 } VULKAN_Shader;
 
