@@ -166,6 +166,16 @@ typedef struct
     SDL_FColor color;
 } VertexPositionColor;
 
+/* Vulkan Buffer */
+typedef struct
+{
+    VkDeviceMemory deviceMemory;
+    VkBuffer buffer;
+    VkDeviceSize size;
+    void *mappedBufferPtr;
+
+} VULKAN_Buffer;
+
 /* Per-texture data */
 typedef struct
 {
@@ -176,8 +186,7 @@ typedef struct
     VkFormat mainImageFormat;
     VkRenderPass mainRenderpasses[SDL_VULKAN_NUM_RENDERPASSES];
     VkFramebuffer mainFramebuffer;
-    VkBuffer stagingBuffer;
-    VkDeviceMemory stagingDeviceMemory;
+    VULKAN_Buffer stagingBuffer;
     VkFilter scaleMode;
     SDL_Rect lockedRect;
 } VULKAN_TextureData;
@@ -192,16 +201,6 @@ typedef struct
     VkPipelineLayout pipelineLayout;
     VkPipeline pipeline;
 } VULKAN_PipelineState;
-
-/* Vulkan Buffer */
-typedef struct
-{
-    VkDeviceMemory deviceMemory;
-    VkBuffer buffer;
-    VkDeviceSize size;
-    void *mappedBufferPtr;
-
-} VULKAN_Buffer;
 
 /* For SRV pool allocator */
 typedef struct
@@ -770,7 +769,7 @@ static VkBlendFactor GetBlendFactor(SDL_BlendFactor factor)
     case SDL_BLENDFACTOR_ONE_MINUS_DST_ALPHA:
         return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
     default:
-        return VK_BLEND_FACTOR_ZERO;
+        return VK_BLEND_FACTOR_MAX_ENUM;
     }
 }
 
@@ -788,7 +787,7 @@ static VkBlendOp GetBlendOp(SDL_BlendOperation operation)
     case SDL_BLENDOPERATION_MAXIMUM:
         return VK_BLEND_OP_MAX;
     default:
-        return VK_BLEND_OP_ADD;
+        return VK_BLEND_OP_MAX_ENUM;
     }
 }
 
@@ -2117,8 +2116,6 @@ static void VULKAN_WindowEvent(SDL_Renderer *renderer, const SDL_WindowEvent *ev
 
 static SDL_bool VULKAN_SupportsBlendMode(SDL_Renderer *renderer, SDL_BlendMode blendMode)
 {
-#if D3D12_PORT
-
     SDL_BlendFactor srcColorFactor = SDL_GetBlendModeSrcColorFactor(blendMode);
     SDL_BlendFactor srcAlphaFactor = SDL_GetBlendModeSrcAlphaFactor(blendMode);
     SDL_BlendOperation colorOperation = SDL_GetBlendModeColorOperation(blendMode);
@@ -2126,13 +2123,14 @@ static SDL_bool VULKAN_SupportsBlendMode(SDL_Renderer *renderer, SDL_BlendMode b
     SDL_BlendFactor dstAlphaFactor = SDL_GetBlendModeDstAlphaFactor(blendMode);
     SDL_BlendOperation alphaOperation = SDL_GetBlendModeAlphaOperation(blendMode);
 
-    if (!GetBlendFunc(srcColorFactor) || !GetBlendFunc(srcAlphaFactor) ||
-        !GetBlendEquation(colorOperation) ||
-        !GetBlendFunc(dstColorFactor) || !GetBlendFunc(dstAlphaFactor) ||
-        !GetBlendEquation(alphaOperation)) {
+    if (GetBlendFactor(srcColorFactor) == VK_BLEND_FACTOR_MAX_ENUM ||
+        GetBlendFactor(srcAlphaFactor)  == VK_BLEND_FACTOR_MAX_ENUM ||
+        GetBlendOp(colorOperation) == VK_BLEND_OP_MAX_ENUM ||
+        GetBlendFactor(dstColorFactor) == VK_BLEND_FACTOR_MAX_ENUM ||
+        GetBlendFactor(dstAlphaFactor) == VK_BLEND_FACTOR_MAX_ENUM ||
+        GetBlendOp(alphaOperation) == VK_BLEND_OP_MAX_ENUM) {
         return SDL_FALSE;
     }
-#endif
     return SDL_TRUE;
 }
 
@@ -2299,14 +2297,7 @@ static void VULKAN_DestroyTexture(SDL_Renderer *renderer,
         vkFreeMemory(rendererData->device, textureData->mainDeviceMemory, NULL);
         textureData->mainDeviceMemory = VK_NULL_HANDLE;
     }
-    if (textureData->stagingBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(rendererData->device, textureData->stagingBuffer, NULL);
-        textureData->stagingBuffer = VK_NULL_HANDLE;
-    }
-    if (textureData->stagingDeviceMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(rendererData->device, textureData->stagingDeviceMemory, NULL);
-        textureData->stagingDeviceMemory = VK_NULL_HANDLE;
-    }
+    VULKAN_DestroyBuffer(rendererData, &textureData->stagingBuffer);
     if (textureData->mainFramebuffer != VK_NULL_HANDLE) {
         vkDestroyFramebuffer(rendererData->device, textureData->mainFramebuffer, NULL);
         textureData->mainFramebuffer = VK_NULL_HANDLE;
@@ -2482,112 +2473,30 @@ static int VULKAN_UpdateTextureNV(SDL_Renderer *renderer, SDL_Texture *texture,
 static int VULKAN_LockTexture(SDL_Renderer *renderer, SDL_Texture *texture,
                              const SDL_Rect *rect, void **pixels, int *pitch)
 {
-#if D3D12_PORT
-
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
     VULKAN_TextureData *textureData = (VULKAN_TextureData *)texture->driverdata;
-    HRESULT result = S_OK;
-
-    VULKAN_RESOURCE_DESC textureDesc;
-    VULKAN_RESOURCE_DESC uploadDesc;
-    VULKAN_HEAP_PROPERTIES heapProps;
-    VULKAN_SUBRESOURCE_FOOTPRINT pitchedDesc;
-    BYTE *textureMemory;
-    int bpp;
-
+    VkResult result;
     if (!textureData) {
         return SDL_SetError("Texture is not currently available");
     }
-#if SDL_HAVE_YUV
-    if (textureData->yuv || textureData->nv12) {
-        /* It's more efficient to upload directly... */
-        if (!textureData->pixels) {
-            textureData->pitch = texture->w;
-            textureData->pixels = (Uint8 *)SDL_malloc((texture->h * textureData->pitch * 3) / 2);
-            if (!textureData->pixels) {
-                return -1;
-            }
-        }
-        textureData->lockedRect = *rect;
-        *pixels =
-            (void *)(textureData->pixels + rect->y * textureData->pitch +
-                     rect->x * SDL_BYTESPERPIXEL(texture->format));
-        *pitch = textureData->pitch;
-        return 0;
-    }
-#endif
-    if (textureData->stagingBuffer) {
+     
+    if (textureData->stagingBuffer.buffer != VK_NULL_HANDLE) {
         return SDL_SetError("texture is already locked");
     }
 
-    /* Create an upload buffer, which will be used to write to the main texture. */
-    SDL_zero(textureDesc);
-    D3D_CALL_RET(textureData->mainTexture, GetDesc, &textureDesc);
-    textureDesc.Width = rect->w;
-    textureDesc.Height = rect->h;
-
-    SDL_zero(uploadDesc);
-    uploadDesc.Dimension = VULKAN_RESOURCE_DIMENSION_BUFFER;
-    uploadDesc.Alignment = VULKAN_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-    uploadDesc.Height = 1;
-    uploadDesc.DepthOrArraySize = 1;
-    uploadDesc.MipLevels = 1;
-    uploadDesc.Format = DXGI_FORMAT_UNKNOWN;
-    uploadDesc.SampleDesc.Count = 1;
-    uploadDesc.SampleDesc.Quality = 0;
-    uploadDesc.Layout = VULKAN_TEXTURE_LAYOUT_ROW_MAJOR;
-    uploadDesc.Flags = VULKAN_RESOURCE_FLAG_NONE;
-
-    /* Figure out how much we need to allocate for the upload buffer */
-    D3D_CALL(rendererData->d3dDevice, GetCopyableFootprints,
-             &textureDesc,
-             0,
-             1,
-             0,
-             NULL,
-             NULL,
-             NULL,
-             &uploadDesc.Width);
-
-    SDL_zero(heapProps);
-    heapProps.Type = VULKAN_HEAP_TYPE_UPLOAD;
-    heapProps.CreationNodeMask = 1;
-    heapProps.VisibleNodeMask = 1;
-
-    /* Create the upload buffer */
-    result = D3D_CALL(rendererData->d3dDevice, CreateCommittedResource,
-                      &heapProps,
-                      VULKAN_HEAP_FLAG_NONE,
-                      &uploadDesc,
-                      VULKAN_RESOURCE_STATE_GENERIC_READ,
-                      NULL,
-                      D3D_GUID(SDL_IID_IVULKANResource),
-                      (void **)&textureData->stagingBuffer);
-    if (FAILED(result)) {
-        return WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANDevice::CreateCommittedResource [create upload buffer]"), result);
+    VkDeviceSize pixelSize = VULKAN_GetBytesPerPixel(textureData->mainImageFormat);
+    VkDeviceSize length = rect->w * pixelSize;
+    VkDeviceSize stagingBufferSize = length * rect->h;
+    result = VULKAN_AllocateBuffer(rendererData,
+        stagingBufferSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+        &textureData->stagingBuffer);
+    if (result != VK_SUCCESS) {
+        return SDL_SetError("[Vulkan] VULKAN_AllocateBuffer with result %s", SDL_Vulkan_GetResultString(result));
     }
-
-    /* Get a write-only pointer to data in the upload buffer: */
-    result = D3D_CALL(textureData->stagingBuffer, Map,
-                      0,
-                      NULL,
-                      (void **)&textureMemory);
-    if (FAILED(result)) {
-        SAFE_RELEASE(rendererData->uploadBuffers[rendererData->currentUploadBuffer]);
-        return WIN_SetErrorFromHRESULT(SDL_COMPOSE_ERROR("IVULKANResource::Map [map staging texture]"), result);
-    }
-
-    SDL_zero(pitchedDesc);
-    pitchedDesc.Format = textureDesc.Format;
-    pitchedDesc.Width = rect->w;
-    pitchedDesc.Height = rect->h;
-    pitchedDesc.Depth = 1;
-    if (pitchedDesc.Format == DXGI_FORMAT_R8_UNORM) {
-        bpp = 1;
-    } else {
-        bpp = 4;
-    }
-    pitchedDesc.RowPitch = VULKAN_Align(rect->w * bpp, VULKAN_TEXTURE_DATA_PITCH_ALIGNMENT);
 
     /* Make note of where the staging texture will be written to
      * (on a call to SDL_UnlockTexture):
@@ -2597,92 +2506,63 @@ static int VULKAN_LockTexture(SDL_Renderer *renderer, SDL_Texture *texture,
     /* Make sure the caller has information on the texture's pixel buffer,
      * then return:
      */
-    *pixels = textureMemory;
-    *pitch = pitchedDesc.RowPitch;
-#endif
+    *pixels = textureData->stagingBuffer.mappedBufferPtr;
+    *pitch = length;
     return 0;
 
 }
 
 static void VULKAN_UnlockTexture(SDL_Renderer *renderer, SDL_Texture *texture)
 {
-#if D3D12_PORT
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
     VULKAN_TextureData *textureData = (VULKAN_TextureData *)texture->driverdata;
-
-    VULKAN_RESOURCE_DESC textureDesc;
-    VULKAN_SUBRESOURCE_FOOTPRINT pitchedDesc;
-    VULKAN_PLACED_SUBRESOURCE_FOOTPRINT placedTextureDesc;
-    VULKAN_TEXTURE_COPY_LOCATION srcLocation;
-    VULKAN_TEXTURE_COPY_LOCATION dstLocation;
-    int bpp;
 
     if (!textureData) {
         return;
     }
-#if SDL_HAVE_YUV
-    if (textureData->yuv || textureData->nv12) {
-        const SDL_Rect *rect = &textureData->lockedRect;
-        void *pixels =
-            (void *)(textureData->pixels + rect->y * textureData->pitch +
-                     rect->x * SDL_BYTESPERPIXEL(texture->format));
-        VULKAN_UpdateTexture(renderer, texture, rect, pixels, textureData->pitch);
-        return;
-    }
-#endif
-    /* Commit the pixel buffer's changes back to the staging texture: */
-    D3D_CALL(textureData->stagingBuffer, Unmap, 0, NULL);
 
-    SDL_zero(textureDesc);
-    D3D_CALL_RET(textureData->mainTexture, GetDesc, &textureDesc);
-    textureDesc.Width = textureData->lockedRect.w;
-    textureDesc.Height = textureData->lockedRect.h;
+    VULKAN_EnsureCommandBuffer(rendererData);
 
-    SDL_zero(pitchedDesc);
-    pitchedDesc.Format = textureDesc.Format;
-    pitchedDesc.Width = (UINT)textureDesc.Width;
-    pitchedDesc.Height = textureDesc.Height;
-    pitchedDesc.Depth = 1;
-    if (pitchedDesc.Format == DXGI_FORMAT_R8_UNORM) {
-        bpp = 1;
-    } else {
-        bpp = 4;
-    }
-    pitchedDesc.RowPitch = VULKAN_Align(textureData->lockedRect.w * bpp, VULKAN_TEXTURE_DATA_PITCH_ALIGNMENT);
+     /* Make sure the destination is in the correct resource state */
+    VULKAN_RecordPipelineImageBarrier(rendererData,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        textureData->mainImage,
+        &textureData->mainImageLayout);
 
-    SDL_zero(placedTextureDesc);
-    placedTextureDesc.Offset = 0;
-    placedTextureDesc.Footprint = pitchedDesc;
-
-    VULKAN_TransitionResource(rendererData, textureData->mainTexture, textureData->mainResourceState, VULKAN_RESOURCE_STATE_COPY_DEST);
-    textureData->mainResourceState = VULKAN_RESOURCE_STATE_COPY_DEST;
-
-    SDL_zero(dstLocation);
-    dstLocation.pResource = textureData->mainTexture;
-    dstLocation.Type = VULKAN_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dstLocation.SubresourceIndex = 0;
-
-    SDL_zero(srcLocation);
-    srcLocation.pResource = textureData->stagingBuffer;
-    srcLocation.Type = VULKAN_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    srcLocation.PlacedFootprint = placedTextureDesc;
-
-    D3D_CALL(rendererData->commandList, CopyTextureRegion,
-             &dstLocation,
-             textureData->lockedRect.x,
-             textureData->lockedRect.y,
-             0,
-             &srcLocation,
-             NULL);
+    VkBufferImageCopy region;
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageOffset.x = textureData->lockedRect.x;
+    region.imageOffset.y = textureData->lockedRect.y;
+    region.imageOffset.z = 0;
+    region.imageExtent.width = textureData->lockedRect.w;
+    region.imageExtent.height = textureData->lockedRect.h;
+    region.imageExtent.depth = 1;
+    vkCmdCopyBufferToImage(rendererData->currentCommandBuffer, textureData->stagingBuffer.buffer, textureData->mainImage, textureData->mainImageLayout, 1, &region);
 
     /* Transition the texture to be shader accessible */
-    VULKAN_TransitionResource(rendererData, textureData->mainTexture, textureData->mainResourceState, VULKAN_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    textureData->mainResourceState = VULKAN_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    VULKAN_RecordPipelineImageBarrier(rendererData,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        textureData->mainImage,
+        &textureData->mainImageLayout);
 
     /* Execute the command list before releasing the staging buffer */
     VULKAN_IssueBatch(rendererData);
-    SAFE_RELEASE(textureData->stagingBuffer);
-#endif
+
+    VULKAN_DestroyBuffer(rendererData, &textureData->stagingBuffer);
 }
 
 static void VULKAN_SetTextureScaleMode(SDL_Renderer *renderer, SDL_Texture *texture, SDL_ScaleMode scaleMode)
@@ -3068,15 +2948,12 @@ static void VULKAN_DrawPrimitives(SDL_Renderer *renderer, VkPrimitiveTopology pr
 
 static void VULKAN_InvalidateCachedState(SDL_Renderer *renderer)
 {
-#if D3D12_PORT
-
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
-    rendererData->currentRenderTargetView.ptr = 0;
-    rendererData->currentShaderResource.ptr = 0;
-    rendererData->currentSampler.ptr = 0;
+    rendererData->currentPipelineState = NULL;
+    rendererData->currentVertexBuffer = 0;
+    rendererData->issueBatch = SDL_FALSE;
     rendererData->cliprectDirty = SDL_TRUE;
-    rendererData->viewportDirty = SDL_TRUE;
-#endif
+    rendererData->currentDescriptorSetIndex = 0;
 }
 
 static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
@@ -3084,20 +2961,6 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
     VULKAN_DrawStateCache stateCache;
     SDL_memset(&stateCache, 0, sizeof(stateCache));
-
-#if D3D12_PORT
-    const int viewportRotation = VULKAN_GetRotationForCurrentRenderTarget(renderer);
-
-    if (rendererData->pixelSizeChanged) {
-        VULKAN_UpdateForWindowSizeChange(renderer);
-        rendererData->pixelSizeChanged = SDL_FALSE;
-    }
-
-    if (rendererData->currentViewportRotation != viewportRotation) {
-        rendererData->currentViewportRotation = viewportRotation;
-        rendererData->viewportDirty = SDL_TRUE;
-    }
-#endif
 
     if (VULKAN_UpdateVertexBuffer(renderer, vertices, vertsize, &stateCache) < 0) {
         return -1;
