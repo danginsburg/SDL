@@ -174,6 +174,8 @@ typedef struct
     VkDeviceMemory mainDeviceMemory;
     VkImageLayout mainImageLayout;
     VkFormat mainImageFormat;
+    VkRenderPass mainRenderpasses[SDL_VULKAN_NUM_RENDERPASSES];
+    VkFramebuffer mainFramebuffer;
     VkBuffer stagingBuffer;
     VkDeviceMemory stagingDeviceMemory;
     VkFilter scaleMode;
@@ -279,6 +281,7 @@ typedef struct
     uint32_t currentSwapchainImageIndex;
     
     /* Cached renderer properties */
+    VULKAN_TextureData *textureRenderTarget;
     SDL_bool cliprectDirty;
     SDL_bool currentCliprectEnabled;
     SDL_Rect currentCliprect;
@@ -297,9 +300,6 @@ Uint32 VULKAN_VkFormatToSDLPixelFormat(VkFormat vkFormat)
     case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_UNORM:
         return SDL_PIXELFORMAT_ARGB8888;
-    case VK_FORMAT_B8G8R8_SRGB:
-    case VK_FORMAT_B8G8R8_UNORM:
-        return SDL_PIXELFORMAT_XRGB8888;
     case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
         return SDL_PIXELFORMAT_XBGR2101010;
     case VK_FORMAT_R16G16B16A16_SFLOAT:
@@ -314,8 +314,6 @@ VkDeviceSize VULKAN_GetBytesPerPixel(VkFormat vkFormat)
     switch (vkFormat) {
     case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_UNORM:
-    case VK_FORMAT_B8G8R8_SRGB:
-    case VK_FORMAT_B8G8R8_UNORM:
     case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
         return 4;
     case VK_FORMAT_R16G16B16A16_SFLOAT:
@@ -331,15 +329,11 @@ static VkFormat SDLPixelFormatToVkTextureFormat(Uint32 format, Uint32 colorspace
     case SDL_PIXELFORMAT_RGBA64_FLOAT:
         return VK_FORMAT_R16G16B16A16_SFLOAT;
     case SDL_PIXELFORMAT_ARGB8888:
+    case SDL_PIXELFORMAT_XRGB8888:
         if (colorspace_conversion && colorspace == SDL_COLORSPACE_SRGB) {
             return VK_FORMAT_B8G8R8A8_SRGB;
         }
         return VK_FORMAT_B8G8R8A8_UNORM;
-    case SDL_PIXELFORMAT_XRGB8888:
-        if (colorspace_conversion && colorspace == SDL_COLORSPACE_SRGB) {
-            return VK_FORMAT_B8G8R8_SRGB;
-        }
-        return VK_FORMAT_B8G8R8_UNORM;
     default:
         return VK_FORMAT_UNDEFINED;
     }
@@ -550,6 +544,12 @@ static VkResult VULKAN_AllocateBuffer(VULKAN_RenderData *rendererData, VkDeviceS
 static void VULKAN_RecordPipelineImageBarrier(VULKAN_RenderData *rendererData, VkAccessFlags sourceAccessMask, VkAccessFlags destAccessMask,
     VkPipelineStageFlags srcStageFlags, VkPipelineStageFlags dstStageFlags, VkImageLayout destLayout, VkImage image, VkImageLayout *imageLayout)
 {
+    /* Stop any outstanding renderpass if open */
+    if (rendererData->currentRenderPass != VK_NULL_HANDLE) {
+        vkCmdEndRenderPass(rendererData->currentCommandBuffer);
+        rendererData->currentRenderPass = VK_NULL_HANDLE;
+    }
+
     VkImageMemoryBarrier barrier = { 0 };
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.srcAccessMask = sourceAccessMask;
@@ -587,20 +587,28 @@ static void VULKAN_BeginRenderPass(VULKAN_RenderData *rendererData, VkAttachment
 {
     switch (loadOp) {
     case VK_ATTACHMENT_LOAD_OP_CLEAR:
-        rendererData->currentRenderPass = rendererData->renderPasses[SDL_VULKAN_RENDERPASS_CLEAR];
+        rendererData->currentRenderPass = rendererData->textureRenderTarget ?
+            rendererData->textureRenderTarget->mainRenderpasses[SDL_VULKAN_RENDERPASS_CLEAR] :
+            rendererData->renderPasses[SDL_VULKAN_RENDERPASS_CLEAR];
         break;
 
     case VK_ATTACHMENT_LOAD_OP_LOAD:
     default:
-        rendererData->currentRenderPass = rendererData->renderPasses[SDL_VULKAN_RENDERPASS_LOAD];
+        rendererData->currentRenderPass = rendererData->textureRenderTarget ?
+            rendererData->textureRenderTarget->mainRenderpasses[SDL_VULKAN_RENDERPASS_LOAD] :
+            rendererData->renderPasses[SDL_VULKAN_RENDERPASS_LOAD];
         break;
     }
+
+    VkFramebuffer framebuffer = rendererData->textureRenderTarget ?
+        rendererData->textureRenderTarget->mainFramebuffer :
+        rendererData->framebuffers[rendererData->currentCommandBufferIndex];
 
     VkRenderPassBeginInfo renderPassBeginInfo = { 0 };
     renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     renderPassBeginInfo.pNext = NULL;
     renderPassBeginInfo.renderPass = rendererData->currentRenderPass;
-    renderPassBeginInfo.framebuffer = rendererData->framebuffers[rendererData->currentCommandBufferIndex];
+    renderPassBeginInfo.framebuffer = framebuffer;
     renderPassBeginInfo.renderArea.offset.x = rendererData->currentViewport.x;
     renderPassBeginInfo.renderArea.offset.y = rendererData->currentViewport.y;
     renderPassBeginInfo.renderArea.extent.width = rendererData->currentViewport.w;
@@ -1558,6 +1566,92 @@ static int VULKAN_GetViewportAlignedD3DRect(SDL_Renderer *renderer, const SDL_Re
 }
 #endif
 
+static VkResult VULKAN_CreateFramebuffersAndRenderPasses(SDL_Renderer *renderer, int w, int h,
+    VkFormat format, int imageViewCount, VkImageView *imageViews, VkFramebuffer *framebuffers, VkRenderPass renderPasses[SDL_VULKAN_NUM_RENDERPASSES])
+{
+    VULKAN_RenderData *rendererData = (VULKAN_RenderData *) renderer->driverdata;
+    VkResult result;
+
+    VkAttachmentDescription attachmentDescription = { 0 };
+    attachmentDescription.format = format;
+    attachmentDescription.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachmentDescription.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachmentDescription.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachmentDescription.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachmentDescription.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachmentDescription.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachmentDescription.samples = 1;
+    attachmentDescription.flags = 0;
+
+    VkAttachmentReference colorAttachmentReference = { 0 };
+    colorAttachmentReference.attachment = 0;
+    colorAttachmentReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpassDescription = { 0 };
+    subpassDescription.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpassDescription.flags = 0;
+    subpassDescription.inputAttachmentCount = 0;
+    subpassDescription.pInputAttachments = NULL;
+    subpassDescription.colorAttachmentCount = 1;
+    subpassDescription.pColorAttachments = &colorAttachmentReference;
+    subpassDescription.pResolveAttachments = NULL;
+    subpassDescription.pDepthStencilAttachment = NULL;
+    subpassDescription.preserveAttachmentCount = 0;
+    subpassDescription.pPreserveAttachments = NULL;
+
+    VkSubpassDependency subPassDependency = { 0 };
+    subPassDependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    subPassDependency.dstSubpass = 0;
+    subPassDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    subPassDependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    subPassDependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    subPassDependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    subPassDependency.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+    VkRenderPassCreateInfo renderPassCreateInfo = { 0 };
+    renderPassCreateInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassCreateInfo.flags = 0;
+    renderPassCreateInfo.attachmentCount = 1;
+    renderPassCreateInfo.pAttachments = &attachmentDescription;
+    renderPassCreateInfo.subpassCount = 1;
+    renderPassCreateInfo.pSubpasses = &subpassDescription;
+    renderPassCreateInfo.dependencyCount = 1;
+    renderPassCreateInfo.pDependencies = &subPassDependency;
+
+    result = vkCreateRenderPass(rendererData->device, &renderPassCreateInfo, NULL, &renderPasses[SDL_VULKAN_RENDERPASS_LOAD]);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateRenderPass(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+
+    attachmentDescription.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    result = vkCreateRenderPass(rendererData->device, &renderPassCreateInfo, NULL, &renderPasses[SDL_VULKAN_RENDERPASS_CLEAR]);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateRenderPass(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
+    }
+
+    VkFramebufferCreateInfo framebufferCreateInfo = { 0 };
+    framebufferCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebufferCreateInfo.pNext = NULL;
+    framebufferCreateInfo.renderPass = rendererData->renderPasses[SDL_VULKAN_RENDERPASS_LOAD];
+    framebufferCreateInfo.attachmentCount = 1;
+    framebufferCreateInfo.width = rendererData->swapchainSize.width;
+    framebufferCreateInfo.height = rendererData->swapchainSize.height;
+    framebufferCreateInfo.layers = 1;
+
+    for (uint32_t i = 0; i < imageViewCount; i++) {
+        framebufferCreateInfo.pAttachments = &imageViews[i];
+        result = vkCreateFramebuffer(rendererData->device, &framebufferCreateInfo, NULL, &framebuffers[i]);
+        if (result != VK_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateFramebuffer(): %s\n", SDL_Vulkan_GetResultString(result));
+            return result;
+        }
+    }
+
+    return result;
+}
+
 static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
 {
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
@@ -1721,88 +1815,19 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
     }
 
     /* Create renderpasses and framebuffer */
-    {
-        VkAttachmentDescription attachmentDescription = { 0 };
-        attachmentDescription.format = rendererData->surfaceFormat.format;
-        attachmentDescription.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        attachmentDescription.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachmentDescription.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        attachmentDescription.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        attachmentDescription.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        attachmentDescription.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        attachmentDescription.samples = 1;
-        attachmentDescription.flags = 0;
-
-        VkAttachmentReference colorAttachmentReference = { 0 };
-        colorAttachmentReference.attachment = 0;
-        colorAttachmentReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-        VkSubpassDescription subpassDescription = { 0 };
-        subpassDescription.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        subpassDescription.flags = 0;
-        subpassDescription.inputAttachmentCount = 0;
-        subpassDescription.pInputAttachments = NULL;
-        subpassDescription.colorAttachmentCount = 1;
-        subpassDescription.pColorAttachments = &colorAttachmentReference;
-        subpassDescription.pResolveAttachments = NULL;
-        subpassDescription.pDepthStencilAttachment = NULL;
-        subpassDescription.preserveAttachmentCount = 0;
-        subpassDescription.pPreserveAttachments = NULL;
-
-        VkSubpassDependency subPassDependency = { 0 };
-        subPassDependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-        subPassDependency.dstSubpass = 0;
-        subPassDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        subPassDependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        subPassDependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        subPassDependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-        subPassDependency.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-
-        VkRenderPassCreateInfo renderPassCreateInfo = { 0 };
-        renderPassCreateInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        renderPassCreateInfo.flags = 0;
-        renderPassCreateInfo.attachmentCount = 1;
-        renderPassCreateInfo.pAttachments = &attachmentDescription;
-        renderPassCreateInfo.subpassCount = 1;
-        renderPassCreateInfo.pSubpasses = &subpassDescription;
-        renderPassCreateInfo.dependencyCount = 1;
-        renderPassCreateInfo.pDependencies = &subPassDependency;
-
-        result = vkCreateRenderPass(rendererData->device, &renderPassCreateInfo, NULL, &rendererData->renderPasses[SDL_VULKAN_RENDERPASS_LOAD]);
-        if (result != VK_SUCCESS) {
-            VULKAN_DestroyAll(renderer);
-            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateRenderPass(): %s\n", SDL_Vulkan_GetResultString(result));
-            return result;
-        }
-
-        attachmentDescription.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        result = vkCreateRenderPass(rendererData->device, &renderPassCreateInfo, NULL, &rendererData->renderPasses[SDL_VULKAN_RENDERPASS_CLEAR]);
-        if (result != VK_SUCCESS) {
-            VULKAN_DestroyAll(renderer);
-            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateRenderPass(): %s\n", SDL_Vulkan_GetResultString(result));
-            return result;
-        }
-
-        VkFramebufferCreateInfo framebufferCreateInfo = { 0 };
-        framebufferCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        framebufferCreateInfo.pNext = NULL;
-        framebufferCreateInfo.renderPass = rendererData->renderPasses[SDL_VULKAN_RENDERPASS_LOAD];
-        framebufferCreateInfo.attachmentCount = 1;
-        framebufferCreateInfo.width = rendererData->swapchainSize.width;
-        framebufferCreateInfo.height = rendererData->swapchainSize.height;
-        framebufferCreateInfo.layers = 1;
-
-        rendererData->framebuffers = SDL_calloc(sizeof(VkFramebuffer), rendererData->swapchainImageCount);
-        for (uint32_t i = 0; i < rendererData->swapchainImageCount; i++) {
-            framebufferCreateInfo.pAttachments = &rendererData->swapchainImageViews[i];
-            result = vkCreateFramebuffer(rendererData->device, &framebufferCreateInfo, NULL, &rendererData->framebuffers[i]);
-            if (result != VK_SUCCESS) {
-                VULKAN_DestroyAll(renderer);
-                SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateFramebuffer(): %s\n", SDL_Vulkan_GetResultString(result));
-                return result;
-            }
-        }
-        
+    rendererData->framebuffers = SDL_calloc(sizeof(VkFramebuffer), rendererData->swapchainImageCount);
+    result = VULKAN_CreateFramebuffersAndRenderPasses(renderer,
+        rendererData->swapchainSize.width,
+        rendererData->swapchainSize.height,
+        rendererData->surfaceFormat.format,
+        rendererData->swapchainImageCount,
+        rendererData->swapchainImageViews,
+        rendererData->framebuffers,
+        rendererData->renderPasses);
+    if ( result != VK_SUCCESS) {
+        VULKAN_DestroyAll(renderer);
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "VULKAN_CreateFramebuffersAndRenderPasses(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
     }
 
     /* Create descriptor pools */
@@ -2223,13 +2248,29 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
     imageViewCreateInfo.subresourceRange.levelCount = 1;
     imageViewCreateInfo.subresourceRange.baseArrayLayer = 0;
     imageViewCreateInfo.subresourceRange.layerCount = 1;
-    result = result = vkCreateImageView(rendererData->device, &imageViewCreateInfo, NULL, &textureData->mainImageView);
+    result = vkCreateImageView(rendererData->device, &imageViewCreateInfo, NULL, &textureData->mainImageView);
     if (result != VK_SUCCESS) {
         VULKAN_DestroyTexture(renderer, texture);
         SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkCreateImageView(): %s\n", SDL_Vulkan_GetResultString(result));
         return result;
     }
-    return 0;
+
+    if (texture->access == SDL_TEXTUREACCESS_TARGET) {
+        result = VULKAN_CreateFramebuffersAndRenderPasses(renderer,
+            texture->w,
+            texture->h,
+            imageCreateInfo.format,
+            1,
+            &textureData->mainImageView,
+            &textureData->mainFramebuffer,
+            textureData->mainRenderpasses);
+        if (result != VK_SUCCESS) {
+            VULKAN_DestroyTexture(renderer, texture);
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "VULKAN_CreateFramebuffersAndRenderPasses(): %s\n", SDL_Vulkan_GetResultString(result));
+            return result;
+        }
+    }
+    return result;
 }
 
 static void VULKAN_DestroyTexture(SDL_Renderer *renderer,
@@ -2265,6 +2306,16 @@ static void VULKAN_DestroyTexture(SDL_Renderer *renderer,
     if (textureData->stagingDeviceMemory != VK_NULL_HANDLE) {
         vkFreeMemory(rendererData->device, textureData->stagingDeviceMemory, NULL);
         textureData->stagingDeviceMemory = VK_NULL_HANDLE;
+    }
+    if (textureData->mainFramebuffer != VK_NULL_HANDLE) {
+        vkDestroyFramebuffer(rendererData->device, textureData->mainFramebuffer, NULL);
+        textureData->mainFramebuffer = VK_NULL_HANDLE;
+    }
+    for (uint32_t i = 0; i < SDL_arraysize(textureData->mainRenderpasses); i++) {
+        if (textureData->mainRenderpasses[i] != VK_NULL_HANDLE) {
+            vkDestroyRenderPass(rendererData->device, textureData->mainRenderpasses[i], NULL);
+            textureData->mainRenderpasses[i] = VK_NULL_HANDLE;
+        }
     }
 
     SDL_free(textureData);
@@ -2307,12 +2358,6 @@ static VkResult VULKAN_UpdateTextureInternal(VULKAN_RenderData *rendererData, Vk
     }
 
     VULKAN_EnsureCommandBuffer(rendererData);
-
-    /* Stop any outstanding renderpass if open */
-    if (rendererData->currentRenderPass != VK_NULL_HANDLE) {
-        vkCmdEndRenderPass(rendererData->currentCommandBuffer);
-        rendererData->currentRenderPass = VK_NULL_HANDLE;
-    }
 
     /* Make sure the destination is in the correct resource state */
     VULKAN_RecordPipelineImageBarrier(rendererData,
@@ -2653,17 +2698,22 @@ static void VULKAN_SetTextureScaleMode(SDL_Renderer *renderer, SDL_Texture *text
 
 static int VULKAN_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
 {
-#if D3D12_PORT
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
     VULKAN_TextureData *textureData = NULL;
 
+    VULKAN_EnsureCommandBuffer(rendererData);
+
     if (!texture) {
         if (rendererData->textureRenderTarget) {
-            VULKAN_TransitionResource(rendererData,
-                                     rendererData->textureRenderTarget->mainTexture,
-                                     rendererData->textureRenderTarget->mainResourceState,
-                                     VULKAN_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            rendererData->textureRenderTarget->mainResourceState = VULKAN_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+            VULKAN_RecordPipelineImageBarrier(rendererData,
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                rendererData->textureRenderTarget->mainImage,
+                &rendererData->textureRenderTarget->mainImageLayout);
         }
         rendererData->textureRenderTarget = NULL;
         return 0;
@@ -2671,18 +2721,20 @@ static int VULKAN_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
 
     textureData = (VULKAN_TextureData *)texture->driverdata;
 
-    if (!textureData->mainTextureRenderTargetView.ptr) {
+    if (textureData->mainImageView == VK_NULL_HANDLE) {
         return SDL_SetError("specified texture is not a render target");
     }
 
     rendererData->textureRenderTarget = textureData;
-    VULKAN_TransitionResource(rendererData,
-                             rendererData->textureRenderTarget->mainTexture,
-                             rendererData->textureRenderTarget->mainResourceState,
-                             VULKAN_RESOURCE_STATE_RENDER_TARGET);
-    rendererData->textureRenderTarget->mainResourceState = VULKAN_RESOURCE_STATE_RENDER_TARGET;
+    VULKAN_RecordPipelineImageBarrier(rendererData,
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                rendererData->textureRenderTarget->mainImage,
+                &rendererData->textureRenderTarget->mainImageLayout);
 
-#endif
     return 0;
 }
 
@@ -3184,18 +3236,15 @@ static int VULKAN_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
         rendererData->currentRenderPass = VK_NULL_HANDLE;
     }
 
-#if D3D12_PORT 
     if (rendererData->textureRenderTarget) {
-        backBuffer = rendererData->textureRenderTarget->mainTexture;
+        backBuffer = rendererData->textureRenderTarget->mainImage;
+        imageLayout = &rendererData->textureRenderTarget->mainImageLayout;
+        vkFormat = rendererData->textureRenderTarget->mainImageFormat;
     } else {
-#endif
         backBuffer = rendererData->swapchainImages[rendererData->currentSwapchainImageIndex];
         imageLayout = &rendererData->swapchainImageLayouts[rendererData->currentSwapchainImageIndex];
         vkFormat = rendererData->surfaceFormat.format;
-        
-#if D3D12_PORT 
     }
-#endif
 
     pixelSize = VULKAN_GetBytesPerPixel(vkFormat);
     length = rect->w * pixelSize;
@@ -3274,10 +3323,6 @@ static int VULKAN_RenderPresent(SDL_Renderer *renderer)
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
     VkResult result = VK_SUCCESS;
     if (rendererData->currentCommandBuffer) {
-        if (rendererData->currentRenderPass) {
-            vkCmdEndRenderPass(rendererData->currentCommandBuffer);
-            rendererData->currentRenderPass = VK_NULL_HANDLE;
-        }
 
         rendererData->currentPipelineState = VK_NULL_HANDLE;
         rendererData->viewportDirty = SDL_TRUE;
@@ -3426,15 +3471,11 @@ SDL_RenderDriver VULKAN_RenderDriver = {
         "vulkan",
         (SDL_RENDERER_ACCELERATED |
          SDL_RENDERER_PRESENTVSYNC), /* flags.  see SDL_RendererFlags */
-        7,                           /* num_texture_formats */
+        3,                           /* num_texture_formats */
         {                            /* texture_formats */
           SDL_PIXELFORMAT_ARGB8888,
           SDL_PIXELFORMAT_XRGB8888,
-          SDL_PIXELFORMAT_RGBA64_FLOAT,
-          SDL_PIXELFORMAT_YV12,
-          SDL_PIXELFORMAT_IYUV,
-          SDL_PIXELFORMAT_NV12,
-          SDL_PIXELFORMAT_NV21 },
+          SDL_PIXELFORMAT_RGBA64_FLOAT },
         16384, /* max_texture_width */
         16384  /* max_texture_height */
     }
