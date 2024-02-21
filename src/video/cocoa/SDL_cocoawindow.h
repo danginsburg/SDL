@@ -74,6 +74,7 @@ typedef enum
 - (BOOL)isMovingOrFocusClickPending;
 - (void)setFocusClickPending:(NSInteger)button;
 - (void)clearFocusClickPending:(NSInteger)button;
+- (void)updateIgnoreMouseState:(NSEvent *)theEvent;
 - (void)setPendingMoveX:(float)x Y:(float)y;
 - (void)windowDidFinishMoving;
 - (void)onMovingOrFocusClickPendingStateCleared;
@@ -97,6 +98,7 @@ typedef enum
 - (NSApplicationPresentationOptions)window:(NSWindow *)window willUseFullScreenPresentationOptions:(NSApplicationPresentationOptions)proposedOptions;
 
 /* See if event is in a drag area, toggle on window dragging. */
+- (void)updateHitTest;
 - (BOOL)processHitTest:(NSEvent *)theEvent;
 
 /* Window event handling */

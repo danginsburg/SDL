@@ -49,13 +49,16 @@
 #endif
 
 static SDL_JoystickDriver *SDL_joystick_drivers[] = {
-#ifdef SDL_JOYSTICK_HIDAPI /* Before WINDOWS_ driver, as WINDOWS wants to check if this driver is handling things */
+#ifdef SDL_JOYSTICK_HIDAPI /* Highest priority driver for supported devices */
     &SDL_HIDAPI_JoystickDriver,
 #endif
-#ifdef SDL_JOYSTICK_RAWINPUT /* Before WINDOWS_ driver, as WINDOWS wants to check if this driver is handling things */
+#ifdef SDL_JOYSTICK_GAMEINPUT /* Higher priority than other Windows drivers */
+    &SDL_GAMEINPUT_JoystickDriver,
+#endif
+#ifdef SDL_JOYSTICK_RAWINPUT
     &SDL_RAWINPUT_JoystickDriver,
 #endif
-#if defined(SDL_JOYSTICK_DINPUT) || defined(SDL_JOYSTICK_XINPUT) /* Before WGI driver, as WGI wants to check if this driver is handling things */
+#if defined(SDL_JOYSTICK_DINPUT) || defined(SDL_JOYSTICK_XINPUT)
     &SDL_WINDOWS_JoystickDriver,
 #endif
 #ifdef SDL_JOYSTICK_WGI
@@ -375,6 +378,7 @@ static Uint32 initial_wheel_devices[] = {
     MAKE_VIDPID(0x0eb7, 0x038e), /* Fanatec ClubSport Wheel Base V1 */
     MAKE_VIDPID(0x0eb7, 0x0e03), /* Fanatec CSL Elite Wheel Base */
     MAKE_VIDPID(0x11ff, 0x0511), /* DragonRise Inc. Wired Wheel (initial mode) (also known as PXN V900 (PS3), Superdrive SV-750, or a Genesis Seaborg 400) */
+    MAKE_VIDPID(0x1209, 0xffb0), /* Generic FFBoard OpenFFBoard universal forcefeedback wheel */
     MAKE_VIDPID(0x2433, 0xf300), /* Asetek SimSports Invicta Wheelbase */
     MAKE_VIDPID(0x2433, 0xf301), /* Asetek SimSports Forte Wheelbase */
     MAKE_VIDPID(0x2433, 0xf303), /* Asetek SimSports La Prima Wheelbase */
@@ -653,6 +657,29 @@ SDL_bool SDL_JoysticksOpened(void)
     SDL_UnlockJoysticks();
 
     return opened;
+}
+
+SDL_bool SDL_JoystickHandledByAnotherDriver(struct SDL_JoystickDriver *driver, Uint16 vendor_id, Uint16 product_id, Uint16 version, const char *name)
+{
+    int i;
+    SDL_bool result = SDL_FALSE;
+
+    SDL_LockJoysticks();
+    {
+        for (i = 0; i < SDL_arraysize(SDL_joystick_drivers); ++i) {
+            if (driver == SDL_joystick_drivers[i]) {
+                /* Higher priority drivers do not have this device */
+                break;
+            }
+            if (SDL_joystick_drivers[i]->IsDevicePresent(vendor_id, product_id, version, name)) {
+                result = SDL_TRUE;
+                break;
+            }
+        }
+    }
+    SDL_UnlockJoysticks();
+
+    return result;
 }
 
 SDL_JoystickID *SDL_GetJoysticks(int *count)

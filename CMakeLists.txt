@@ -332,7 +332,8 @@ set_option(SDL_METAL               "Enable Metal support" ${APPLE})
 set_option(SDL_KMSDRM              "Use KMS DRM video driver" ${UNIX_SYS})
 dep_option(SDL_KMSDRM_SHARED       "Dynamically load KMS DRM support" ON "SDL_KMSDRM" OFF)
 set_option(SDL_OFFSCREEN           "Use offscreen video driver" ON)
-dep_option(SDL_VIDEO_CAPTURE       "Enable video capturing" ON SDL_VIDEO OFF)
+dep_option(SDL_CAMERA              "Enable camera support" ON SDL_VIDEO OFF)
+set_option(SDL_DUMMYCAMERA         "Support the dummy camera driver" ON)
 option_string(SDL_BACKGROUNDING_SIGNAL "number to use for magic backgrounding signal or 'OFF'" OFF)
 option_string(SDL_FOREGROUNDING_SIGNAL "number to use for magic foregrounding signal or 'OFF'" OFF)
 dep_option(SDL_HIDAPI              "Enable the HIDAPI subsystem" ON "NOT VISIONOS" OFF)
@@ -372,14 +373,22 @@ if(SDL_SHARED)
   add_library(SDL3-shared SHARED)
   add_library(SDL3::SDL3-shared ALIAS SDL3-shared)
   SDL_AddCommonCompilerFlags(SDL3-shared)
-  target_compile_features(SDL3-shared PRIVATE c_std_99)
+  if ("c_std_99" IN_LIST CMAKE_C_COMPILE_FEATURES)
+    target_compile_features(SDL3-shared PRIVATE c_std_99)
+  else()
+    message(WARNING "target_compile_features does not know c_std_99 for C compiler")
+  endif()
 endif()
 
 if(SDL_STATIC)
   add_library(SDL3-static STATIC)
   add_library(SDL3::SDL3-static ALIAS SDL3-static)
   SDL_AddCommonCompilerFlags(SDL3-static)
-  target_compile_features(SDL3-static PRIVATE c_std_99)
+  if ("c_std_99" IN_LIST CMAKE_C_COMPILE_FEATURES)
+    target_compile_features(SDL3-static PRIVATE c_std_99)
+  else()
+    message(WARNING "target_compile_features does not know c_std_99 for C compiler")
+  endif()
 endif()
 
 if(SDL_TEST_LIBRARY)
@@ -454,6 +463,7 @@ sdl_glob_sources(
   "${SDL3_SOURCE_DIR}/src/*.c"
   "${SDL3_SOURCE_DIR}/src/atomic/*.c"
   "${SDL3_SOURCE_DIR}/src/audio/*.c"
+  "${SDL3_SOURCE_DIR}/src/camera/*.c"
   "${SDL3_SOURCE_DIR}/src/core/*.c"
   "${SDL3_SOURCE_DIR}/src/cpuinfo/*.c"
   "${SDL3_SOURCE_DIR}/src/dynapi/*.c"
@@ -1172,6 +1182,23 @@ if(SDL_AUDIO)
   endif()
 endif()
 
+if(SDL_CAMERA)
+  # CheckDummyCamera/CheckDiskCamera - valid for all platforms
+  if(SDL_DUMMYCAMERA)
+    set(SDL_CAMERA_DRIVER_DUMMY 1)
+    sdl_glob_sources("${SDL3_SOURCE_DIR}/src/camera/dummy/*.c")
+    set(HAVE_DUMMYCAMERA TRUE)
+    set(HAVE_SDL_CAMERA TRUE)
+  endif()
+  # !!! FIXME: for later.
+  #if(SDL_DISKCAMERA)
+  #  set(SDL_CAMERA_DRIVER_DISK 1)
+  #  sdl_glob_sources("${SDL3_SOURCE_DIR}/src/camera/disk/*.c")
+  #  set(HAVE_DISKCAMERA TRUE)
+  #  set(HAVE_SDL_CAMERA TRUE)
+  #endif()
+endif()
+
 if(UNIX OR APPLE)
   # Relevant for Unix/Darwin only
   set(DYNAPI_NEEDS_DLOPEN 1)
@@ -1289,6 +1316,12 @@ if(ANDROID)
     sdl_glob_sources("${SDL3_SOURCE_DIR}/src/sensor/android/*.c")
   endif()
 
+  if(SDL_CAMERA)
+    set(SDL_CAMERA_DRIVER_ANDROID 1)
+    set(HAVE_CAMERA TRUE)
+    sdl_glob_sources("${SDL3_SOURCE_DIR}/src/camera/android/*.c")
+  endif()
+
   if(SDL_VIDEO)
     set(SDL_VIDEO_DRIVER_ANDROID 1)
     sdl_glob_sources("${SDL3_SOURCE_DIR}/src/video/android/*.c")
@@ -1399,6 +1432,12 @@ elseif(EMSCRIPTEN)
   sdl_glob_sources("${SDL3_SOURCE_DIR}/src/filesystem/emscripten/*.c")
   set(HAVE_SDL_FILESYSTEM TRUE)
 
+  if(SDL_CAMERA)
+    set(SDL_CAMERA_DRIVER_EMSCRIPTEN 1)
+    set(HAVE_CAMERA TRUE)
+    sdl_glob_sources("${SDL3_SOURCE_DIR}/src/camera/emscripten/*.c")
+  endif()
+
   if(SDL_JOYSTICK)
     set(SDL_JOYSTICK_EMSCRIPTEN 1)
     sdl_glob_sources("${SDL3_SOURCE_DIR}/src/joystick/emscripten/*.c")
@@ -1498,6 +1537,9 @@ elseif(UNIX AND NOT APPLE AND NOT RISCOS AND NOT HAIKU)
               ioctl(0, KDGKBENT, &kbe);
               return 0;
           }" HAVE_INPUT_KD)
+      check_c_source_compiles("
+          #include <linux/videodev2.h>
+          int main(int argc, char** argv) { return 0; }" HAVE_LINUX_VIDEODEV2_H)
     elseif(FREEBSD)
       check_c_source_compiles("
           #include <sys/kbio.h>
@@ -1519,6 +1561,12 @@ elseif(UNIX AND NOT APPLE AND NOT RISCOS AND NOT HAIKU)
               ioctl(0, WSKBDIO_GETMAP, &data);
               return 0;
           }" HAVE_INPUT_WSCONS)
+    endif()
+
+    if(SDL_CAMERA AND HAVE_LINUX_VIDEODEV2_H)
+      set(SDL_CAMERA_DRIVER_V4L2 1)
+      set(HAVE_CAMERA TRUE)
+      sdl_glob_sources("${SDL3_SOURCE_DIR}/src/camera/v4l2/*.c")
     endif()
 
     if(HAVE_LINUX_INPUT_H)
@@ -2023,7 +2071,9 @@ elseif(APPLE)
   sdl_glob_sources("${SDL3_SOURCE_DIR}/src/file/cocoa/*.m")
 
   if(IOS OR TVOS OR MACOSX OR DARWIN)
-    sdl_sources("${SDL3_SOURCE_DIR}/src/video/SDL_video_capture_apple.m")
+    set(SDL_CAMERA_DRIVER_COREMEDIA 1)
+    set(HAVE_CAMERA TRUE)
+    sdl_glob_sources("${SDL3_SOURCE_DIR}/src/camera/coremedia/*.m")
   endif()
 
   if(IOS OR TVOS OR VISIONOS)
@@ -2726,6 +2776,10 @@ endif()
 if(NOT HAVE_SDL_MISC)
   set(SDL_MISC_DUMMY 1)
   sdl_glob_sources("${SDL3_SOURCE_DIR}/src/misc/dummy/*.c")
+endif()
+if(NOT HAVE_CAMERA)
+  set(SDL_CAMERA_DRIVER_DUMMY 1)
+  sdl_glob_sources("${SDL3_SOURCE_DIR}/src/camera/dummy/*.c")
 endif()
 
 # We always need to have threads and timers around

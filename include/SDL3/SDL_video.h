@@ -353,6 +353,17 @@ extern DECLSPEC SDL_DisplayID SDLCALL SDL_GetPrimaryDisplay(void);
 /**
  * Get the properties associated with a display.
  *
+ * The following read-only properties are provided by SDL:
+ *
+ * - `SDL_PROP_DISPLAY_HDR_ENABLED_BOOLEAN`: true if the display has High
+ *   Dynamic Range enabled
+ * - `SDL_PROP_DISPLAY_SDR_WHITE_LEVEL_FLOAT`: the luminance, in nits, that
+ *   SDR white is rendered on this display. If this value is not set or is
+ *   zero, the value 200 is a reasonable default when HDR is enabled.
+ * - `SDL_PROP_DISPLAY_HDR_WHITE_LEVEL_FLOAT`: the maximum luminance, in nits,
+ *   of HDR content on this display. If this value is not set or is zero, the
+ *   value 400 is a reasonable default when HDR is enabled.
+ *
  * \param displayID the instance ID of the display to query
  * \returns a valid property ID on success or 0 on failure; call
  *          SDL_GetError() for more information.
@@ -363,6 +374,10 @@ extern DECLSPEC SDL_DisplayID SDLCALL SDL_GetPrimaryDisplay(void);
  * \sa SDL_SetProperty
  */
 extern DECLSPEC SDL_PropertiesID SDLCALL SDL_GetDisplayProperties(SDL_DisplayID displayID);
+
+#define SDL_PROP_DISPLAY_HDR_ENABLED_BOOLEAN            "SDL.display.HDR_enabled"
+#define SDL_PROP_DISPLAY_SDR_WHITE_LEVEL_FLOAT          "SDL.display.SDR_white_level"
+#define SDL_PROP_DISPLAY_HDR_WHITE_LEVEL_FLOAT          "SDL.display.HDR_white_level"
 
 /**
  * Get the name of a display in UTF-8 encoding.
@@ -831,6 +846,8 @@ extern DECLSPEC SDL_Window *SDLCALL SDL_CreatePopupWindow(SDL_Window *parent, in
  *   be always on top
  * - `SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN`: true if the window has no
  *   window decoration
+ * - `SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN`: true if the
+ *   window will be used with an externally managed graphics context.
  * - `SDL_PROP_WINDOW_CREATE_FOCUSABLE_BOOLEAN`: true if the window should
  *   accept keyboard input (defaults true)
  * - `SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN`: true if the window should
@@ -883,18 +900,18 @@ extern DECLSPEC SDL_Window *SDLCALL SDL_CreatePopupWindow(SDL_Window *parent, in
  *
  * These are additional supported properties on Wayland:
  *
- * - `SDL_PROP_WINDOW_CREATE_WAYLAND_SCALE_TO_DISPLAY` - true if the window
- *   should use forced scaling designed to produce 1:1 pixel mapping if not
- *   flagged as being DPI-aware. This is intended to allow legacy applications
- *   to be displayed without desktop scaling being applied, and has issues
- *   with certain display configurations, as this forces the window to behave
- *   in a way that Wayland desktops were not designed to accommodate.
- *   Potential issues include, but are not limited to: rounding errors can
- *   result when odd window sizes/scales are used, the window may be unusably
- *   small, the window may jump in visible size at times, the window may
- *   appear to be larger than the desktop space, and possible loss of cursor
- *   precision can occur. New applications should be designed with proper DPI
- *   awareness and handling instead of enabling this.
+ * - `SDL_PROP_WINDOW_CREATE_WAYLAND_SCALE_TO_DISPLAY_BOOLEAN` - true if the
+ *   window should use forced scaling designed to produce 1:1 pixel mapping if
+ *   not flagged as being DPI-aware. This is intended to allow legacy
+ *   applications to be displayed without desktop scaling being applied, and
+ *   has issues with certain display configurations, as this forces the window
+ *   to behave in a way that Wayland desktops were not designed to
+ *   accommodate. Potential issues include, but are not limited to: rounding
+ *   errors can result when odd window sizes/scales are used, the window may
+ *   be unusably small, the window may jump in visible size at times, the
+ *   window may appear to be larger than the desktop space, and possible loss
+ *   of cursor precision can occur. New applications should be designed with
+ *   proper DPI awareness and handling instead of enabling this.
  * - `SDL_PROP_WINDOW_CREATE_WAYLAND_SURFACE_ROLE_CUSTOM_BOOLEAN` - true if
  *   the application wants to use the Wayland surface for a custom role and
  *   does not want it attached to an XDG toplevel window. See
@@ -934,18 +951,19 @@ extern DECLSPEC SDL_Window *SDLCALL SDL_CreatePopupWindow(SDL_Window *parent, in
  */
 extern DECLSPEC SDL_Window *SDLCALL SDL_CreateWindowWithProperties(SDL_PropertiesID props);
 
-#define SDL_PROP_WINDOW_CREATE_ALWAYS_ON_TOP_BOOLEAN               "always-on-top"
+#define SDL_PROP_WINDOW_CREATE_ALWAYS_ON_TOP_BOOLEAN               "always_on_top"
 #define SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN                  "borderless"
 #define SDL_PROP_WINDOW_CREATE_FOCUSABLE_BOOLEAN                   "focusable"
+#define SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN   "external_graphics_context"
 #define SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN                  "fullscreen"
 #define SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER                       "height"
 #define SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN                      "hidden"
-#define SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN          "high-pixel-density"
+#define SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN          "high_pixel_density"
 #define SDL_PROP_WINDOW_CREATE_MAXIMIZED_BOOLEAN                   "maximized"
 #define SDL_PROP_WINDOW_CREATE_MENU_BOOLEAN                        "menu"
 #define SDL_PROP_WINDOW_CREATE_METAL_BOOLEAN                       "metal"
 #define SDL_PROP_WINDOW_CREATE_MINIMIZED_BOOLEAN                   "minimized"
-#define SDL_PROP_WINDOW_CREATE_MOUSE_GRABBED_BOOLEAN               "mouse-grabbed"
+#define SDL_PROP_WINDOW_CREATE_MOUSE_GRABBED_BOOLEAN               "mouse_grabbed"
 #define SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN                      "opengl"
 #define SDL_PROP_WINDOW_CREATE_PARENT_POINTER                      "parent"
 #define SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN                   "resizable"
@@ -959,7 +977,7 @@ extern DECLSPEC SDL_Window *SDLCALL SDL_CreateWindowWithProperties(SDL_Propertie
 #define SDL_PROP_WINDOW_CREATE_Y_NUMBER                            "y"
 #define SDL_PROP_WINDOW_CREATE_COCOA_WINDOW_POINTER                "cocoa.window"
 #define SDL_PROP_WINDOW_CREATE_COCOA_VIEW_POINTER                  "cocoa.view"
-#define SDL_PROP_WINDOW_CREATE_WAYLAND_SCALE_TO_DISPLAY            "wayland.scale_to_display"
+#define SDL_PROP_WINDOW_CREATE_WAYLAND_SCALE_TO_DISPLAY_BOOLEAN    "wayland.scale_to_display"
 #define SDL_PROP_WINDOW_CREATE_WAYLAND_SURFACE_ROLE_CUSTOM_BOOLEAN "wayland.surface_role_custom"
 #define SDL_PROP_WINDOW_CREATE_WAYLAND_CREATE_EGL_WINDOW_BOOLEAN   "wayland.create_egl_window"
 #define SDL_PROP_WINDOW_CREATE_WAYLAND_WL_SURFACE_POINTER          "wayland.wl_surface"
@@ -1016,6 +1034,9 @@ extern DECLSPEC SDL_Window *SDLCALL SDL_GetWindowParent(SDL_Window *window);
  * Get the properties associated with a window.
  *
  * The following read-only properties are provided by SDL:
+ *
+ * - `SDL_PROP_WINDOW_SHAPE_POINTER`: the surface associated with a shaped
+ *   window
  *
  * On Android:
  *
@@ -1109,6 +1130,7 @@ extern DECLSPEC SDL_Window *SDLCALL SDL_GetWindowParent(SDL_Window *window);
  */
 extern DECLSPEC SDL_PropertiesID SDLCALL SDL_GetWindowProperties(SDL_Window *window);
 
+#define SDL_PROP_WINDOW_SHAPE_POINTER                   "SDL.window.shape"
 #define SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER          "SDL.window.android.window"
 #define SDL_PROP_WINDOW_ANDROID_SURFACE_POINTER         "SDL.window.android.surface"
 #define SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER            "SDL.window.uikit.window"
@@ -1684,7 +1706,7 @@ extern DECLSPEC int SDLCALL SDL_SyncWindow(SDL_Window *window);
  *
  * \sa SDL_GetWindowSurface
  */
-extern DECLSPEC SDL_bool SDLCALL SDL_HasWindowSurface(SDL_Window *window);
+extern DECLSPEC SDL_bool SDLCALL SDL_WindowHasSurface(SDL_Window *window);
 
 /**
  * Get the SDL surface associated with the window.
@@ -1707,7 +1729,7 @@ extern DECLSPEC SDL_bool SDLCALL SDL_HasWindowSurface(SDL_Window *window);
  * \since This function is available since SDL 3.0.0.
  *
  * \sa SDL_DestroyWindowSurface
- * \sa SDL_HasWindowSurface
+ * \sa SDL_WindowHasSurface
  * \sa SDL_UpdateWindowSurface
  * \sa SDL_UpdateWindowSurfaceRects
  */
@@ -1769,7 +1791,7 @@ extern DECLSPEC int SDLCALL SDL_UpdateWindowSurfaceRects(SDL_Window *window, con
  * \since This function is available since SDL 3.0.0.
  *
  * \sa SDL_GetWindowSurface
- * \sa SDL_HasWindowSurface
+ * \sa SDL_WindowHasSurface
  */
 extern DECLSPEC int SDLCALL SDL_DestroyWindowSurface(SDL_Window *window);
 
@@ -2107,6 +2129,30 @@ typedef SDL_HitTestResult (SDLCALL *SDL_HitTest)(SDL_Window *win,
  * \since This function is available since SDL 3.0.0.
  */
 extern DECLSPEC int SDLCALL SDL_SetWindowHitTest(SDL_Window *window, SDL_HitTest callback, void *callback_data);
+
+/**
+ * Set the shape of a transparent window.
+ *
+ * This sets the alpha channel of a transparent window and any fully
+ * transparent areas are also transparent to mouse clicks. If you are using
+ * something besides the SDL render API, then you are responsible for setting
+ * the alpha channel of the window yourself.
+ *
+ * The shape is copied inside this function, so you can free it afterwards. If
+ * your shape surface changes, you should call SDL_SetWindowShape() again to
+ * update the window.
+ *
+ * The window must have been created with the SDL_WINDOW_TRANSPARENT flag.
+ *
+ * \param window the window
+ * \param shape the surface representing the shape of the window, or NULL to
+ *              remove any current shape
+ * \returns 0 on success or a negative error code on failure; call
+ *          SDL_GetError() for more information.
+ *
+ * \since This function is available since SDL 3.0.0.
+ */
+extern DECLSPEC int SDLCALL SDL_SetWindowShape(SDL_Window *window, SDL_Surface *shape);
 
 /**
  * Request a window to demand attention from the user.

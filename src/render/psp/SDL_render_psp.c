@@ -20,7 +20,7 @@
 */
 #include "SDL_internal.h"
 
-#ifdef SDL_VIDEO_RENDER_PSP
+#if SDL_VIDEO_RENDER_PSP
 
 #include "../SDL_sysrender.h"
 
@@ -624,7 +624,7 @@ static int PSP_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
     return 0;
 }
 
-static int PSP_QueueSetViewport(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
+static int PSP_QueueNoOp(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
 {
     return 0; /* nothing to do in this backend. */
 }
@@ -656,6 +656,7 @@ static int PSP_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, SDL
 {
     int i;
     int count = indices ? num_indices : num_vertices;
+    const float color_scale = cmd->data.draw.color_scale;
 
     cmd->data.draw.count = count;
     size_indices = indices ? size_indices : 0;
@@ -688,10 +689,10 @@ static int PSP_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, SDL
             verts->y = xy_[1] * scale_y;
             verts->z = 0;
 
-            verts->col.r = (Uint8)SDL_roundf(col_->r * 255.0f);
-            verts->col.g = (Uint8)SDL_roundf(col_->g * 255.0f);
-            verts->col.b = (Uint8)SDL_roundf(col_->b * 255.0f);
-            verts->col.a = (Uint8)SDL_roundf(col_->a * 255.0f);
+            verts->col.r = (Uint8)SDL_roundf(SDL_clamp(col_->r * color_scale, 0.0f, 1.0f) * 255.0f);
+            verts->col.g = (Uint8)SDL_roundf(SDL_clamp(col_->g * color_scale, 0.0f, 1.0f) * 255.0f);
+            verts->col.b = (Uint8)SDL_roundf(SDL_clamp(col_->b * color_scale, 0.0f, 1.0f) * 255.0f);
+            verts->col.a = (Uint8)SDL_roundf(SDL_clamp(col_->a, 0.0f, 1.0f) * 255.0f);
 
             verts++;
         }
@@ -727,10 +728,10 @@ static int PSP_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, SDL
             verts->y = xy_[1] * scale_y;
             verts->z = 0;
 
-            verts->col.r = (Uint8)SDL_roundf(col_->r * 255.0f);
-            verts->col.g = (Uint8)SDL_roundf(col_->g * 255.0f);
-            verts->col.b = (Uint8)SDL_roundf(col_->b * 255.0f);
-            verts->col.a = (Uint8)SDL_roundf(col_->a * 255.0f);
+            verts->col.r = (Uint8)SDL_roundf(SDL_clamp(col_->r * color_scale, 0.0f, 1.0f) * 255.0f);
+            verts->col.g = (Uint8)SDL_roundf(SDL_clamp(col_->g * color_scale, 0.0f, 1.0f) * 255.0f);
+            verts->col.b = (Uint8)SDL_roundf(SDL_clamp(col_->b * color_scale, 0.0f, 1.0f) * 255.0f);
+            verts->col.a = (Uint8)SDL_roundf(SDL_clamp(col_->a, 0.0f, 1.0f) * 255.0f);
 
             verts->u = uv_[0] * psp_texture->textureWidth;
             verts->v = uv_[1] * psp_texture->textureHeight;
@@ -1063,11 +1064,16 @@ static int PSP_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, v
         switch (cmd->command) {
         case SDL_RENDERCMD_SETDRAWCOLOR:
         {
-            const Uint8 r = (Uint8)SDL_roundf(cmd->data.color.color.r * 255.0f);
-            const Uint8 g = (Uint8)SDL_roundf(cmd->data.color.color.g * 255.0f);
-            const Uint8 b = (Uint8)SDL_roundf(cmd->data.color.color.b * 255.0f);
-            const Uint8 a = (Uint8)SDL_roundf(cmd->data.color.color.a * 255.0f);
+            const Uint8 r = (Uint8)SDL_roundf(SDL_clamp(cmd->data.color.color.r * cmd->data.color.color_scale, 0.0f, 1.0f) * 255.0f);
+            const Uint8 g = (Uint8)SDL_roundf(SDL_clamp(cmd->data.color.color.g * cmd->data.color.color_scale, 0.0f, 1.0f) * 255.0f);
+            const Uint8 b = (Uint8)SDL_roundf(SDL_clamp(cmd->data.color.color.b * cmd->data.color.color_scale, 0.0f, 1.0f) * 255.0f);
+            const Uint8 a = (Uint8)SDL_roundf(SDL_clamp(cmd->data.color.color.a, 0.0f, 1.0f) * 255.0f);
             drawstate.color = GU_RGBA(r, g, b, a);
+            break;
+        }
+
+        case SDL_RENDERCMD_SETCOLORSCALE:
+        {
             break;
         }
 
@@ -1094,10 +1100,10 @@ static int PSP_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, v
 
         case SDL_RENDERCMD_CLEAR:
         {
-            const Uint8 r = (Uint8)SDL_roundf(cmd->data.color.color.r * 255.0f);
-            const Uint8 g = (Uint8)SDL_roundf(cmd->data.color.color.g * 255.0f);
-            const Uint8 b = (Uint8)SDL_roundf(cmd->data.color.color.b * 255.0f);
-            const Uint8 a = (Uint8)SDL_roundf(cmd->data.color.color.a * 255.0f);
+            const Uint8 r = (Uint8)SDL_roundf(SDL_clamp(cmd->data.color.color.r * cmd->data.color.color_scale, 0.0f, 1.0f) * 255.0f);
+            const Uint8 g = (Uint8)SDL_roundf(SDL_clamp(cmd->data.color.color.g * cmd->data.color.color_scale, 0.0f, 1.0f) * 255.0f);
+            const Uint8 b = (Uint8)SDL_roundf(SDL_clamp(cmd->data.color.color.b * cmd->data.color.color_scale, 0.0f, 1.0f) * 255.0f);
+            const Uint8 a = (Uint8)SDL_roundf(SDL_clamp(cmd->data.color.color.a, 0.0f, 1.0f) * 255.0f);
             sceGuClearColor(GU_RGBA(r, g, b, a));
             sceGuClearStencil(a);
             sceGuClear(GU_COLOR_BUFFER_BIT | GU_STENCIL_BUFFER_BIT);
@@ -1212,12 +1218,6 @@ static int PSP_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, v
     return 0;
 }
 
-static int PSP_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
-                                Uint32 pixel_format, void *pixels, int pitch)
-{
-    return SDL_Unsupported();
-}
-
 static int PSP_RenderPresent(SDL_Renderer *renderer)
 {
     PSP_RenderData *data = (PSP_RenderData *)renderer->driverdata;
@@ -1325,8 +1325,9 @@ SDL_Renderer *PSP_CreateRenderer(SDL_Window *window, SDL_PropertiesID create_pro
     renderer->UnlockTexture = PSP_UnlockTexture;
     renderer->SetTextureScaleMode = PSP_SetTextureScaleMode;
     renderer->SetRenderTarget = PSP_SetRenderTarget;
-    renderer->QueueSetViewport = PSP_QueueSetViewport;
-    renderer->QueueSetDrawColor = PSP_QueueSetViewport; /* SetViewport and SetDrawColor are (currently) no-ops. */
+    renderer->QueueSetViewport = PSP_QueueNoOp;
+    renderer->QueueSetDrawColor = PSP_QueueNoOp;
+    renderer->QueueSetColorScale = PSP_QueueNoOp;
     renderer->QueueDrawPoints = PSP_QueueDrawPoints;
     renderer->QueueDrawLines = PSP_QueueDrawPoints; /* lines and points queue vertices the same way. */
     renderer->QueueGeometry = PSP_QueueGeometry;
@@ -1335,7 +1336,6 @@ SDL_Renderer *PSP_CreateRenderer(SDL_Window *window, SDL_PropertiesID create_pro
     renderer->QueueCopyEx = PSP_QueueCopyEx;
     renderer->InvalidateCachedState = PSP_InvalidateCachedState;
     renderer->RunCommandQueue = PSP_RunCommandQueue;
-    renderer->RenderReadPixels = PSP_RenderReadPixels;
     renderer->RenderPresent = PSP_RenderPresent;
     renderer->DestroyTexture = PSP_DestroyTexture;
     renderer->DestroyRenderer = PSP_DestroyRenderer;

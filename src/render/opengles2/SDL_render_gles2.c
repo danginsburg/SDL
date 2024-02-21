@@ -20,12 +20,13 @@
 */
 #include "SDL_internal.h"
 
-#if defined(SDL_VIDEO_RENDER_OGL_ES2) && !defined(SDL_RENDER_DISABLED)
+#if SDL_VIDEO_RENDER_OGL_ES2
 
 #include "../../video/SDL_sysvideo.h" /* For SDL_RecreateWindow */
 #include <SDL3/SDL_opengles2.h>
 #include "../SDL_sysrender.h"
 #include "../../video/SDL_blit.h"
+#include "../../video/SDL_pixels_c.h"
 #include "SDL_shaders_gles2.h"
 
 /* WebGL doesn't offer client-side arrays, so use Vertex Buffer Objects
@@ -79,24 +80,6 @@ typedef struct GLES2_TextureData
     GLES2_FBOList *fbo;
 } GLES2_TextureData;
 
-typedef struct GLES2_ProgramCacheEntry
-{
-    GLuint id;
-    GLuint vertex_shader;
-    GLuint fragment_shader;
-    GLuint uniform_locations[16];
-    GLfloat projection[4][4];
-    struct GLES2_ProgramCacheEntry *prev;
-    struct GLES2_ProgramCacheEntry *next;
-} GLES2_ProgramCacheEntry;
-
-typedef struct GLES2_ProgramCache
-{
-    int count;
-    GLES2_ProgramCacheEntry *head;
-    GLES2_ProgramCacheEntry *tail;
-} GLES2_ProgramCache;
-
 typedef enum
 {
     GLES2_ATTRIBUTE_POSITION = 0,
@@ -109,8 +92,40 @@ typedef enum
     GLES2_UNIFORM_PROJECTION,
     GLES2_UNIFORM_TEXTURE,
     GLES2_UNIFORM_TEXTURE_U,
-    GLES2_UNIFORM_TEXTURE_V
+    GLES2_UNIFORM_TEXTURE_V,
+    GLES2_UNIFORM_OFFSET,
+    GLES2_UNIFORM_MATRIX,
+    NUM_GLES2_UNIFORMS
 } GLES2_Uniform;
+
+static const char *GLES2_UniformNames[] = {
+    "u_projection",
+    "u_texture",
+    "u_texture_u",
+    "u_texture_v",
+    "u_offset",
+    "u_matrix"
+};
+SDL_COMPILE_TIME_ASSERT(GLES2_UniformNames, SDL_arraysize(GLES2_UniformNames) == NUM_GLES2_UNIFORMS);
+
+typedef struct GLES2_ProgramCacheEntry
+{
+    GLuint id;
+    GLuint vertex_shader;
+    GLuint fragment_shader;
+    GLuint uniform_locations[NUM_GLES2_UNIFORMS];
+    GLfloat projection[4][4];
+    const float *shader_params;
+    struct GLES2_ProgramCacheEntry *prev;
+    struct GLES2_ProgramCacheEntry *next;
+} GLES2_ProgramCacheEntry;
+
+typedef struct GLES2_ProgramCache
+{
+    int count;
+    GLES2_ProgramCacheEntry *head;
+    GLES2_ProgramCacheEntry *tail;
+} GLES2_ProgramCache;
 
 typedef enum
 {
@@ -144,6 +159,7 @@ typedef struct
     int drawablew;
     int drawableh;
     GLES2_ProgramCacheEntry *program;
+    const float *shader_params;
     GLfloat projection[4][4];
 } GLES2_DrawStateCache;
 
@@ -391,6 +407,7 @@ static GLES2_ProgramCacheEntry *GLES2_CacheProgram(GLES2_RenderData *data, GLuin
 {
     GLES2_ProgramCacheEntry *entry;
     GLint linkSuccessful;
+    int i;
 
     /* Check if we've already cached this program */
     entry = data->program_cache.head;
@@ -441,14 +458,9 @@ static GLES2_ProgramCacheEntry *GLES2_CacheProgram(GLES2_RenderData *data, GLuin
     }
 
     /* Predetermine locations of uniform variables */
-    entry->uniform_locations[GLES2_UNIFORM_PROJECTION] =
-        data->glGetUniformLocation(entry->id, "u_projection");
-    entry->uniform_locations[GLES2_UNIFORM_TEXTURE_V] =
-        data->glGetUniformLocation(entry->id, "u_texture_v");
-    entry->uniform_locations[GLES2_UNIFORM_TEXTURE_U] =
-        data->glGetUniformLocation(entry->id, "u_texture_u");
-    entry->uniform_locations[GLES2_UNIFORM_TEXTURE] =
-        data->glGetUniformLocation(entry->id, "u_texture");
+    for (i = 0; i < NUM_GLES2_UNIFORMS; ++i) {
+        entry->uniform_locations[i] = data->glGetUniformLocation(entry->id, GLES2_UniformNames[i]);
+    }
 
     data->glUseProgram(entry->id);
     if (entry->uniform_locations[GLES2_UNIFORM_TEXTURE_V] != -1) {
@@ -588,12 +600,13 @@ static int GLES2_CacheShaders(GLES2_RenderData *data)
     return 0;
 }
 
-static int GLES2_SelectProgram(GLES2_RenderData *data, GLES2_ImageSource source, int w, int h)
+static int GLES2_SelectProgram(GLES2_RenderData *data, GLES2_ImageSource source, SDL_Colorspace colorspace)
 {
     GLuint vertex;
     GLuint fragment;
     GLES2_ShaderType vtype, ftype;
     GLES2_ProgramCacheEntry *program;
+    const float *shader_params = NULL;
 
     /* Select an appropriate shader pair for the specified modes */
     vtype = GLES2_SHADER_VERTEX_DEFAULT;
@@ -615,58 +628,34 @@ static int GLES2_SelectProgram(GLES2_RenderData *data, GLES2_ImageSource source,
         break;
 #if SDL_HAVE_YUV
     case GLES2_IMAGESOURCE_TEXTURE_YUV:
-        switch (SDL_GetYUVConversionModeForResolution(w, h)) {
-        case SDL_YUV_CONVERSION_JPEG:
-            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_YUV_JPEG;
-            break;
-        case SDL_YUV_CONVERSION_BT601:
-            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_YUV_BT601;
-            break;
-        case SDL_YUV_CONVERSION_BT709:
-            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_YUV_BT709;
-            break;
-        default:
-            SDL_SetError("Unsupported YUV conversion mode: %d\n", SDL_GetYUVConversionModeForResolution(w, h));
+        ftype = GLES2_SHADER_FRAGMENT_TEXTURE_YUV;
+        shader_params = SDL_GetYCbCRtoRGBConversionMatrix(colorspace, 0, 0, 8);
+        if (!shader_params) {
+            SDL_SetError("Unsupported YUV colorspace");
             goto fault;
         }
         break;
     case GLES2_IMAGESOURCE_TEXTURE_NV12:
-        switch (SDL_GetYUVConversionModeForResolution(w, h)) {
-        case SDL_YUV_CONVERSION_JPEG:
-            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV12_JPEG;
-            break;
-        case SDL_YUV_CONVERSION_BT601:
-            if (SDL_GetHintBoolean("SDL_RENDER_OPENGL_NV12_RG_SHADER", SDL_FALSE)) {
-                ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV12_RG_BT601;
-            } else {
-                ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV12_RA_BT601;
-            }
-            break;
-        case SDL_YUV_CONVERSION_BT709:
-            if (SDL_GetHintBoolean("SDL_RENDER_OPENGL_NV12_RG_SHADER", SDL_FALSE)) {
-                ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV12_RG_BT709;
-            } else {
-                ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV12_RA_BT709;
-            }
-            break;
-        default:
-            SDL_SetError("Unsupported YUV conversion mode: %d\n", SDL_GetYUVConversionModeForResolution(w, h));
+        if (SDL_GetHintBoolean("SDL_RENDER_OPENGL_NV12_RG_SHADER", SDL_FALSE)) {
+            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV12_RG;
+        } else {
+            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV12_RA;
+        }
+        shader_params = SDL_GetYCbCRtoRGBConversionMatrix(colorspace, 0, 0, 8);
+        if (!shader_params) {
+            SDL_SetError("Unsupported YUV colorspace");
             goto fault;
         }
         break;
     case GLES2_IMAGESOURCE_TEXTURE_NV21:
-        switch (SDL_GetYUVConversionModeForResolution(w, h)) {
-        case SDL_YUV_CONVERSION_JPEG:
-            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV21_JPEG;
-            break;
-        case SDL_YUV_CONVERSION_BT601:
-            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV21_BT601;
-            break;
-        case SDL_YUV_CONVERSION_BT709:
-            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV21_BT709;
-            break;
-        default:
-            SDL_SetError("Unsupported YUV conversion mode: %d\n", SDL_GetYUVConversionModeForResolution(w, h));
+        if (SDL_GetHintBoolean("SDL_RENDER_OPENGL_NV12_RG_SHADER", SDL_FALSE)) {
+            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV21_RG;
+        } else {
+            ftype = GLES2_SHADER_FRAGMENT_TEXTURE_NV21_RA;
+        }
+        shader_params = SDL_GetYCbCRtoRGBConversionMatrix(colorspace, 0, 0, 8);
+        if (!shader_params) {
+            SDL_SetError("Unsupported YUV colorspace");
             goto fault;
         }
         break;
@@ -698,7 +687,8 @@ static int GLES2_SelectProgram(GLES2_RenderData *data, GLES2_ImageSource source,
     /* Check if we need to change programs at all */
     if (data->drawstate.program &&
         data->drawstate.program->vertex_shader == vertex &&
-        data->drawstate.program->fragment_shader == fragment) {
+        data->drawstate.program->fragment_shader == fragment &&
+        data->drawstate.program->shader_params == shader_params) {
         return 0;
     }
 
@@ -711,6 +701,28 @@ static int GLES2_SelectProgram(GLES2_RenderData *data, GLES2_ImageSource source,
     /* Select that program in OpenGL */
     data->glUseProgram(program->id);
 
+    if (shader_params && shader_params != program->shader_params) {
+        /* YUV shader params are Yoffset, 0, Rcoeff, 0, Gcoeff, 0, Bcoeff, 0 */
+        if (program->uniform_locations[GLES2_UNIFORM_OFFSET] != -1) {
+            data->glUniform3f(program->uniform_locations[GLES2_UNIFORM_OFFSET], shader_params[0], shader_params[1], shader_params[2]);
+        }
+        if (program->uniform_locations[GLES2_UNIFORM_MATRIX] != -1) {
+            GLfloat matrix[3 * 3];
+
+            matrix[0 * 3 + 0] = shader_params[4];
+            matrix[0 * 3 + 1] = shader_params[5];
+            matrix[0 * 3 + 2] = shader_params[6];
+            matrix[1 * 3 + 0] = shader_params[8];
+            matrix[1 * 3 + 1] = shader_params[9];
+            matrix[1 * 3 + 2] = shader_params[10];
+            matrix[2 * 3 + 0] = shader_params[12];
+            matrix[2 * 3 + 1] = shader_params[13];
+            matrix[2 * 3 + 2] = shader_params[14];
+            data->glUniformMatrix3fv(program->uniform_locations[GLES2_UNIFORM_MATRIX], 1, GL_FALSE, matrix);
+        }
+        program->shader_params = shader_params;
+    }
+
     /* Set the current program */
     data->drawstate.program = program;
 
@@ -721,7 +733,7 @@ fault:
     return -1;
 }
 
-static int GLES2_QueueSetViewport(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
+static int GLES2_QueueNoOp(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
 {
     return 0; /* nothing to do in this backend. */
 }
@@ -732,10 +744,15 @@ static int GLES2_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd,
     SDL_VertexSolid *verts = (SDL_VertexSolid *)SDL_AllocateRenderVertices(renderer, count * sizeof(*verts), 0, &cmd->data.draw.first);
     int i;
     SDL_FColor color = cmd->data.draw.color;
+    const float color_scale = cmd->data.draw.color_scale;
 
     if (!verts) {
         return -1;
     }
+
+    color.r *= color_scale;
+    color.g *= color_scale;
+    color.b *= color_scale;
 
     if (colorswap) {
         float r = color.r;
@@ -761,10 +778,15 @@ static int GLES2_QueueDrawLines(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
     GLfloat prevx, prevy;
     SDL_VertexSolid *verts = (SDL_VertexSolid *)SDL_AllocateRenderVertices(renderer, count * sizeof(*verts), 0, &cmd->data.draw.first);
     SDL_FColor color = cmd->data.draw.color;
+    const float color_scale = cmd->data.draw.color_scale;
 
     if (!verts) {
         return -1;
     }
+
+    color.r *= color_scale;
+    color.g *= color_scale;
+    color.b *= color_scale;
 
     if (colorswap) {
         float r = color.r;
@@ -814,6 +836,7 @@ static int GLES2_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
     int i;
     const SDL_bool colorswap = (renderer->target && (renderer->target->format == SDL_PIXELFORMAT_BGRA32 || renderer->target->format == SDL_PIXELFORMAT_BGRX32));
     int count = indices ? num_indices : num_vertices;
+    const float color_scale = cmd->data.draw.color_scale;
 
     cmd->data.draw.count = count;
     size_indices = indices ? size_indices : 0;
@@ -845,6 +868,10 @@ static int GLES2_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
 
             verts->position.x = xy_[0] * scale_x;
             verts->position.y = xy_[1] * scale_y;
+
+            col_.r *= color_scale;
+            col_.g *= color_scale;
+            col_.b *= color_scale;
 
             if (colorswap) {
                 float r = col_.r;
@@ -884,6 +911,10 @@ static int GLES2_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, S
 
             verts->position.x = xy_[0] * scale_x;
             verts->position.y = xy_[1] * scale_y;
+
+            col_.r *= color_scale;
+            col_.g *= color_scale;
+            col_.b *= color_scale;
 
             if (colorswap) {
                 float r = col_.r;
@@ -961,7 +992,7 @@ static int SetDrawState(GLES2_RenderData *data, const SDL_RenderCommand *cmd, co
         data->glVertexAttribPointer(GLES2_ATTRIBUTE_TEXCOORD, 2, GL_FLOAT, GL_FALSE, stride, (const GLvoid *)&verts->tex_coord);
     }
 
-    if (GLES2_SelectProgram(data, imgsrc, texture ? texture->w : 0, texture ? texture->h : 0) < 0) {
+    if (GLES2_SelectProgram(data, imgsrc, texture ? texture->colorspace : SDL_COLORSPACE_SRGB) < 0) {
         return -1;
     }
 
@@ -1207,6 +1238,11 @@ static int GLES2_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd,
             break;
         }
 
+        case SDL_RENDERCMD_SETCOLORSCALE:
+        {
+            break;
+        }
+
         case SDL_RENDERCMD_SETVIEWPORT:
         {
             SDL_Rect *viewport = &data->drawstate.viewport;
@@ -1234,17 +1270,20 @@ static int GLES2_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd,
 
         case SDL_RENDERCMD_CLEAR:
         {
-            const float r = colorswap ? cmd->data.color.color.b : cmd->data.color.color.r;
-            const float g = cmd->data.color.color.g;
-            const float b = colorswap ? cmd->data.color.color.r : cmd->data.color.color.b;
+            const float r = (colorswap ? cmd->data.color.color.b : cmd->data.color.color.r) * cmd->data.color.color_scale;
+            const float g = cmd->data.color.color.g * cmd->data.color.color_scale;
+            const float b = (colorswap ? cmd->data.color.color.r : cmd->data.color.color.b) * cmd->data.color.color_scale;
             const float a = cmd->data.color.color.a;
             if (data->drawstate.clear_color_dirty ||
                 (r != data->drawstate.clear_color.r) ||
                 (g != data->drawstate.clear_color.g) ||
                 (b != data->drawstate.clear_color.b) ||
                 (a != data->drawstate.clear_color.a)) {
-                data->glClearColor(r, g, g, a);
-                data->drawstate.clear_color = cmd->data.color.color;
+                data->glClearColor(r, g, b, a);
+                data->drawstate.clear_color.r = r;
+                data->drawstate.clear_color.g = g;
+                data->drawstate.clear_color.b = b;
+                data->drawstate.clear_color.a = a;
                 data->drawstate.clear_color_dirty = SDL_FALSE;
             }
 
@@ -1536,6 +1575,9 @@ static int GLES2_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
         }
         SDL_SetNumberProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_OPENGLES2_TEXTURE_U_NUMBER, data->texture_u);
 
+        if (!SDL_GetYCbCRtoRGBConversionMatrix(texture->colorspace, texture->w, texture->h, 8)) {
+            return SDL_SetError("Unsupported YUV colorspace");
+        }
     } else if (data->nv12) {
         data->texture_u = (GLuint)SDL_GetNumberProperty(create_props, SDL_PROP_TEXTURE_CREATE_OPENGLES2_TEXTURE_UV_NUMBER, 0);
         if (data->texture_u) {
@@ -1557,6 +1599,10 @@ static int GLES2_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
             return -1;
         }
         SDL_SetNumberProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_OPENGLES2_TEXTURE_UV_NUMBER, data->texture_u);
+
+        if (!SDL_GetYCbCRtoRGBConversionMatrix(texture->colorspace, texture->w, texture->h, 8)) {
+            return SDL_SetError("Unsupported YUV colorspace");
+        }
     }
 #endif
 
@@ -1583,7 +1629,7 @@ static int GLES2_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SDL
         }
     }
     SDL_SetNumberProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_OPENGLES2_TEXTURE_NUMBER, data->texture);
-    SDL_SetNumberProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_OPENGLES2_TEXTURE_TARGET, data->texture_type);
+    SDL_SetNumberProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_OPENGLES2_TEXTURE_TARGET_NUMBER, data->texture_type);
 
     if (texture->access == SDL_TEXTUREACCESS_TARGET) {
         data->fbo = GLES2_GetFBO(renderer->driverdata, texture->w, texture->h);
@@ -1914,61 +1960,45 @@ static void GLES2_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture)
     }
 }
 
-static int GLES2_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
-                                  Uint32 pixel_format, void *pixels, int pitch)
+static SDL_Surface *GLES2_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect)
 {
     GLES2_RenderData *data = (GLES2_RenderData *)renderer->driverdata;
-    Uint32 temp_format = renderer->target ? renderer->target->format : SDL_PIXELFORMAT_RGBA32;
-    size_t buflen;
-    void *temp_pixels;
-    int temp_pitch;
-    Uint8 *src, *dst, *tmp;
-    int w, h, length, rows;
-    int status;
+    Uint32 format = renderer->target ? renderer->target->format : SDL_PIXELFORMAT_RGBA32;
+    int w, h;
+    SDL_Surface *surface;
 
-    temp_pitch = rect->w * SDL_BYTESPERPIXEL(temp_format);
-    buflen = (size_t)rect->h * temp_pitch;
-    if (buflen == 0) {
-        return 0; /* nothing to do. */
-    }
-
-    temp_pixels = SDL_malloc(buflen);
-    if (!temp_pixels) {
-        return -1;
+    surface = SDL_CreateSurface(rect->w, rect->h, format);
+    if (!surface) {
+        return NULL;
     }
 
     SDL_GetCurrentRenderOutputSize(renderer, &w, &h);
 
     data->glReadPixels(rect->x, renderer->target ? rect->y : (h - rect->y) - rect->h,
-                       rect->w, rect->h, GL_RGBA, GL_UNSIGNED_BYTE, temp_pixels);
+                       rect->w, rect->h, GL_RGBA, GL_UNSIGNED_BYTE, surface->pixels);
     if (GL_CheckError("glReadPixels()", renderer) < 0) {
-        return -1;
+        SDL_DestroySurface(surface);
+        return NULL;
     }
 
     /* Flip the rows to be top-down if necessary */
     if (!renderer->target) {
         SDL_bool isstack;
-        length = rect->w * SDL_BYTESPERPIXEL(temp_format);
-        src = (Uint8 *)temp_pixels + (rect->h - 1) * temp_pitch;
-        dst = (Uint8 *)temp_pixels;
-        tmp = SDL_small_alloc(Uint8, length, &isstack);
-        rows = rect->h / 2;
+        int length = rect->w * SDL_BYTESPERPIXEL(format);
+        Uint8 *src = (Uint8 *)surface->pixels + (rect->h - 1) * surface->pitch;
+        Uint8 *dst = (Uint8 *)surface->pixels;
+        Uint8 *tmp = SDL_small_alloc(Uint8, length, &isstack);
+        int rows = rect->h / 2;
         while (rows--) {
             SDL_memcpy(tmp, dst, length);
             SDL_memcpy(dst, src, length);
             SDL_memcpy(src, tmp, length);
-            dst += temp_pitch;
-            src -= temp_pitch;
+            dst += surface->pitch;
+            src -= surface->pitch;
         }
         SDL_small_free(tmp, isstack);
     }
-
-    status = SDL_ConvertPixels(rect->w, rect->h,
-                               temp_format, temp_pixels, temp_pitch,
-                               pixel_format, pixels, pitch);
-    SDL_free(temp_pixels);
-
-    return status;
+    return surface;
 }
 
 static int GLES2_RenderPresent(SDL_Renderer *renderer)
@@ -2156,8 +2186,9 @@ static SDL_Renderer *GLES2_CreateRenderer(SDL_Window *window, SDL_PropertiesID c
     renderer->UnlockTexture = GLES2_UnlockTexture;
     renderer->SetTextureScaleMode = GLES2_SetTextureScaleMode;
     renderer->SetRenderTarget = GLES2_SetRenderTarget;
-    renderer->QueueSetViewport = GLES2_QueueSetViewport;
-    renderer->QueueSetDrawColor = GLES2_QueueSetViewport; /* SetViewport and SetDrawColor are (currently) no-ops. */
+    renderer->QueueSetViewport = GLES2_QueueNoOp;
+    renderer->QueueSetDrawColor = GLES2_QueueNoOp;
+    renderer->QueueSetColorScale = GLES2_QueueNoOp;
     renderer->QueueDrawPoints = GLES2_QueueDrawPoints;
     renderer->QueueDrawLines = GLES2_QueueDrawLines;
     renderer->QueueGeometry = GLES2_QueueGeometry;
@@ -2240,4 +2271,4 @@ SDL_RenderDriver GLES2_RenderDriver = {
       0 }
 };
 
-#endif /* SDL_VIDEO_RENDER_OGL_ES2 && !defined(SDL_RENDER_DISABLED) */
+#endif /* SDL_VIDEO_RENDER_OGL_ES2 */

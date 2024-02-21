@@ -139,17 +139,6 @@ typedef int (SDLCALL *SDL_blit) (struct SDL_Surface *src, const SDL_Rect *srcrec
 
 
 /**
- * The formula used for converting between YUV and RGB
- */
-typedef enum
-{
-    SDL_YUV_CONVERSION_JPEG,        /**< Full range JPEG */
-    SDL_YUV_CONVERSION_BT601,       /**< BT.601 (the default) */
-    SDL_YUV_CONVERSION_BT709,       /**< BT.709 */
-    SDL_YUV_CONVERSION_AUTOMATIC    /**< BT.601 for SD content, BT.709 for HD content */
-} SDL_YUV_CONVERSION_MODE;
-
-/**
  * Allocate a new RGB surface with a specific pixel format.
  *
  * \param width the width of the surface
@@ -221,17 +210,6 @@ extern DECLSPEC void SDLCALL SDL_DestroySurface(SDL_Surface *surface);
  *   point formats, SDL_COLORSPACE_HDR10 for 10-bit formats,
  *   SDL_COLORSPACE_SRGB for other RGB surfaces and SDL_COLORSPACE_BT709_FULL
  *   for YUV textures.
- * - `SDL_PROP_SURFACE_MAXCLL_NUMBER`: MaxCLL (Maximum Content Light Level)
- *   indicates the maximum light level of any single pixel (in cd/m2 or nits)
- *   of the entire playback sequence. MaxCLL is usually measured off the final
- *   delivered content after mastering. If one uses the full light level of
- *   the HDR mastering display and adds a hard clip at its maximum value,
- *   MaxCLL would be equal to the peak luminance of the mastering monitor.
- * - `SDL_PROP_SURFACE_MAXFALL_NUMBER`: MaxFALL (Maximum Frame Average Light
- *   Level) indicates the maximum value of the frame average light level (in
- *   cd/m2 or nits) of the entire playback sequence. MaxFALL is calculated by
- *   averaging the decoded luminance values of all the pixels within a frame.
- *   MaxFALL is usually much lower than MaxCLL.
  * - `SDL_PROP_SURFACE_TONEMAP_OPERATOR_STRING`: the tone mapping operator
  *   used when converting between different colorspaces. Currently this
  *   supports the form "*=N", where N is a floating point scale factor applied
@@ -249,8 +227,6 @@ extern DECLSPEC void SDLCALL SDL_DestroySurface(SDL_Surface *surface);
 extern DECLSPEC SDL_PropertiesID SDLCALL SDL_GetSurfaceProperties(SDL_Surface *surface);
 
 #define SDL_PROP_SURFACE_COLORSPACE_NUMBER                  "SDL.surface.colorspace"
-#define SDL_PROP_SURFACE_MAXCLL_NUMBER                      "SDL.surface.maxCLL"
-#define SDL_PROP_SURFACE_MAXFALL_NUMBER                     "SDL.surface.maxFALL"
 #define SDL_PROP_SURFACE_TONEMAP_OPERATOR_STRING            "SDL.surface.tonemap"
 
 /**
@@ -1043,36 +1019,6 @@ extern DECLSPEC int SDLCALL SDL_BlitSurfaceUncheckedScaled(SDL_Surface *src, con
  * \since This function is available since SDL 3.0.0.
  */
 extern DECLSPEC int SDLCALL SDL_ReadSurfacePixel(SDL_Surface *surface, int x, int y, Uint8 *r, Uint8 *g, Uint8 *b, Uint8 *a);
-
-/**
- * Set the YUV conversion mode
- *
- * \param mode YUV conversion mode
- *
- * \since This function is available since SDL 3.0.0.
- */
-extern DECLSPEC void SDLCALL SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_MODE mode);
-
-/**
- * Get the YUV conversion mode
- *
- * \returns YUV conversion mode
- *
- * \since This function is available since SDL 3.0.0.
- */
-extern DECLSPEC SDL_YUV_CONVERSION_MODE SDLCALL SDL_GetYUVConversionMode(void);
-
-/**
- * Get the YUV conversion mode, returning the correct mode for the resolution
- * when the current conversion mode is SDL_YUV_CONVERSION_AUTOMATIC
- *
- * \param width width
- * \param height height
- * \returns YUV conversion mode
- *
- * \since This function is available since SDL 3.0.0.
- */
-extern DECLSPEC SDL_YUV_CONVERSION_MODE SDLCALL SDL_GetYUVConversionModeForResolution(int width, int height);
 
 /* Ends C function definitions when using C++ */
 #ifdef __cplusplus

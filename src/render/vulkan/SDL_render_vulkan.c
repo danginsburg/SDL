@@ -36,6 +36,7 @@
 #include "../SDL_sysrender.h"
 #include "../SDL_sysvideo.h"
 #include "../SDL_d3dmath.h"
+#include "../../video/SDL_pixels_c.h"
 
 extern const char *SDL_Vulkan_GetResultString(VkResult result);
 
@@ -341,14 +342,14 @@ VkDeviceSize VULKAN_GetBytesPerPixel(VkFormat vkFormat)
     }
 }
 
-static VkFormat SDLPixelFormatToVkTextureFormat(Uint32 format, Uint32 colorspace, SDL_bool colorspace_conversion)
+static VkFormat SDLPixelFormatToVkTextureFormat(Uint32 format, Uint32 colorspace)
 {
     switch (format) {
     case SDL_PIXELFORMAT_RGBA64_FLOAT:
         return VK_FORMAT_R16G16B16A16_SFLOAT;
     case SDL_PIXELFORMAT_ARGB8888:
     case SDL_PIXELFORMAT_XRGB8888:
-        if (colorspace_conversion && colorspace == SDL_COLORSPACE_SRGB) {
+        if (colorspace == SDL_COLORSPACE_SRGB) {
             return VK_FORMAT_B8G8R8A8_SRGB;
         }
         return VK_FORMAT_B8G8R8A8_UNORM;
@@ -1833,7 +1834,7 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
 
     VkFormat desiredFormat = VK_FORMAT_B8G8R8A8_UNORM;
     VkColorSpaceKHR desiredColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-    if (renderer->colorspace_conversion && renderer->output_colorspace == SDL_COLORSPACE_SRGB) {
+    if (renderer->output_colorspace == SDL_COLORSPACE_SRGB) {
         desiredFormat = VK_FORMAT_B8G8R8A8_SRGB;
     }
     else if (renderer->output_colorspace == SDL_COLORSPACE_SCRGB) {
@@ -2189,7 +2190,7 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
     VULKAN_TextureData *textureData;
     VkResult result;
     VkImage externalImage = VK_NULL_HANDLE;
-    VkFormat textureFormat = SDLPixelFormatToVkTextureFormat(texture->format,  texture->colorspace, renderer->colorspace_conversion);
+    VkFormat textureFormat = SDLPixelFormatToVkTextureFormat(texture->format,  texture->colorspace);
     uint32_t width = texture->w;
     uint32_t height = texture->h;
     
@@ -2694,7 +2695,7 @@ static int VULKAN_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
     return 0;
 }
 
-static int VULKAN_QueueSetViewport(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
+static int VULKAN_QueueNoOp(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
 {
     return 0; /* nothing to do in this backend. */
 }
@@ -3021,6 +3022,7 @@ static SDL_bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderComm
     if (textureData->yuv) {
         VULKAN_Shader shader;
 
+        /* @TEMP - need to turn these into constants
         switch (SDL_GetYUVConversionModeForResolution(texture->w, texture->h)) {
         case SDL_YUV_CONVERSION_JPEG:
             shader = SHADER_YUV_JPEG;
@@ -3033,7 +3035,8 @@ static SDL_bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderComm
             break;
         default:
             return SDL_SetError("Unsupported YUV conversion mode");
-        }
+        } */
+        shader = SHADER_YUV_JPEG;
 
         /* Make sure each texture is in the correct state to be accessed by the pixel shader. */
         VULKAN_RecordPipelineImageBarrier(rendererData,
@@ -3064,6 +3067,7 @@ static SDL_bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderComm
     } else if (textureData->nv12) {
         VULKAN_Shader shader;
 
+        /* @TEMP need to turn these into constantas
         switch (SDL_GetYUVConversionModeForResolution(texture->w, texture->h)) {
         case SDL_YUV_CONVERSION_JPEG:
             shader = SHADER_NV_JPEG;
@@ -3076,7 +3080,8 @@ static SDL_bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderComm
             break;
         default:
             return SDL_SetError("Unsupported YUV conversion mode");
-        }
+        }*/
+        shader = SHADER_NV_JPEG;
 
         /* Make sure each texture is in the correct state to be accessed by the pixel shader. */
          VULKAN_RecordPipelineImageBarrier(rendererData,
@@ -3245,8 +3250,7 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
     return 0;
 }
 
-static int VULKAN_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
-                                  Uint32 format, void *pixels, int pitch)
+static SDL_Surface* VULKAN_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect)
 {
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
     VkImage backBuffer;
@@ -3257,6 +3261,7 @@ static int VULKAN_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
     VkDeviceSize readbackBufferSize;
     VkFormat vkFormat;
     int status;
+    SDL_Surface *output;
 
     VULKAN_EnsureCommandBuffer(rendererData);
 
@@ -3285,7 +3290,8 @@ static int VULKAN_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
         &readbackBuffer) != VK_SUCCESS) {
-        return SDL_SetError("[Vulkan] Failed to allocate buffer for readback.");
+        SDL_SetError("[Vulkan] Failed to allocate buffer for readback.");
+        return NULL;
     }
 
 
@@ -3329,23 +3335,16 @@ static int VULKAN_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
         backBuffer,
         imageLayout);
 
-    /* Copy the data into the desired buffer, converting pixels to the
-     * desired format at the same time:
-     */
-    status = SDL_ConvertPixelsAndColorspace(
+    output = SDL_DuplicatePixels(
         rect->w, rect->h,
         VULKAN_VkFormatToSDLPixelFormat(vkFormat),
         renderer->target ? renderer->target->colorspace : renderer->output_colorspace,
         readbackBuffer.mappedBufferPtr,
-        length,
-        format,
-        renderer->input_colorspace,
-        pixels,
-        pitch);
+        length);
 
     VULKAN_DestroyBuffer(rendererData, &readbackBuffer);
 
-    return status;
+    return output;
 }
 
 static int VULKAN_RenderPresent(SDL_Renderer *renderer)
@@ -3474,8 +3473,9 @@ SDL_Renderer *VULKAN_CreateRenderer(SDL_Window *window, SDL_PropertiesID create_
     renderer->UnlockTexture = VULKAN_UnlockTexture;
     renderer->SetTextureScaleMode = VULKAN_SetTextureScaleMode;
     renderer->SetRenderTarget = VULKAN_SetRenderTarget;
-    renderer->QueueSetViewport = VULKAN_QueueSetViewport;
-    renderer->QueueSetDrawColor = VULKAN_QueueSetViewport; /* SetViewport and SetDrawColor are (currently) no-ops. */
+    renderer->QueueSetViewport = VULKAN_QueueNoOp;
+    renderer->QueueSetDrawColor = VULKAN_QueueNoOp;
+    renderer->QueueSetColorScale = VULKAN_QueueNoOp;
     renderer->QueueDrawPoints = VULKAN_QueueDrawPoints;
     renderer->QueueDrawLines = VULKAN_QueueDrawPoints; /* lines and points queue vertices the same way. */
     renderer->QueueGeometry = VULKAN_QueueGeometry;

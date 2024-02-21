@@ -147,8 +147,17 @@ SDL_bool SDL_GetMasksForPixelFormatEnum(Uint32 format, int *bpp, Uint32 *Rmask,
     /* Partial support for SDL_Surface with FOURCC */
     if (SDL_ISPIXELFORMAT_FOURCC(format)) {
         /* Not a format that uses masks */
-        *bpp = 0;
         *Rmask = *Gmask = *Bmask = *Amask = 0;
+        // however, some of these are packed formats, and can legit declare bits-per-pixel!
+        switch (format) {
+            case SDL_PIXELFORMAT_YUY2:
+            case SDL_PIXELFORMAT_UYVY:
+            case SDL_PIXELFORMAT_YVYU:
+                *bpp = 32;
+                break;
+            default:
+                *bpp = 0;  // oh well.
+        }
         return SDL_TRUE;
     }
 #else
@@ -598,8 +607,8 @@ int SDL_InitFormat(SDL_PixelFormat *format, Uint32 pixel_format)
     /* Set up the format */
     SDL_zerop(format);
     format->format = pixel_format;
-    format->BitsPerPixel = (Uint8)bpp;
-    format->BytesPerPixel = (Uint8)((bpp + 7) / 8);
+    format->bits_per_pixel = (Uint8)bpp;
+    format->bytes_per_pixel = (Uint8)((bpp + 7) / 8);
 
     format->Rmask = Rmask;
     format->Rshift = 0;
@@ -695,7 +704,7 @@ void SDL_DestroyPixelFormat(SDL_PixelFormat *format)
 SDL_Colorspace SDL_GetDefaultColorspaceForFormat(Uint32 format)
 {
     if (SDL_ISPIXELFORMAT_FOURCC(format)) {
-        return SDL_COLORSPACE_BT709_FULL;
+        return SDL_COLORSPACE_YUV_DEFAULT;
     } else if (SDL_ISPIXELFORMAT_FLOAT(format)) {
         return SDL_COLORSPACE_SCRGB;
     } else if (SDL_ISPIXELFORMAT_10BIT(format)) {
@@ -759,9 +768,133 @@ float SDL_PQfromNits(float v)
     const float m2 = 78.84375f;
 
     float y = SDL_clamp(v / 10000.0f, 0.0f, 1.0f);
-    float num = c1 + c2 * pow(y, m1);
-    float den = 1.0f + c3 * pow(y, m1);
-    return pow(num / den, m2);
+    float num = c1 + c2 * SDL_powf(y, m1);
+    float den = 1.0f + c3 * SDL_powf(y, m1);
+    return SDL_powf(num / den, m2);
+}
+
+/* This is a helpful tool for deriving these:
+ * https://kdashg.github.io/misc/colors/from-coeffs.html
+ */
+static const float mat_BT601_Limited_8bit[] = {
+    -0.0627451017f, -0.501960814f, -0.501960814f, 0.0f, /* offset */
+    1.1644f, 0.0000f, 1.5960f, 0.0f,                    /* Rcoeff */
+    1.1644f, -0.3918f, -0.8130f, 0.0f,                  /* Gcoeff */
+    1.1644f, 2.0172f, 0.0000f, 0.0f,                    /* Bcoeff */
+};
+
+static const float mat_BT601_Full_8bit[] = {
+    0.0f, -0.501960814f, -0.501960814f, 0.0f,           /* offset */
+    1.0000f, 0.0000f, 1.4020f, 0.0f,                    /* Rcoeff */
+    1.0000f, -0.3441f, -0.7141f, 0.0f,                  /* Gcoeff */
+    1.0000f, 1.7720f, 0.0000f, 0.0f,                    /* Bcoeff */
+};
+
+static const float mat_BT709_Limited_8bit[] = {
+    -0.0627451017f, -0.501960814f, -0.501960814f, 0.0f, /* offset */
+    1.1644f, 0.0000f, 1.7927f, 0.0f,                    /* Rcoeff */
+    1.1644f, -0.2132f, -0.5329f, 0.0f,                  /* Gcoeff */
+    1.1644f, 2.1124f, 0.0000f, 0.0f,                    /* Bcoeff */
+};
+
+static const float mat_BT709_Full_8bit[] = {
+    0.0f, -0.501960814f, -0.501960814f, 0.0f,           /* offset */
+    1.0000f, 0.0000f, 1.5748f, 0.0f,                    /* Rcoeff */
+    1.0000f, -0.1873f, -0.4681f, 0.0f,                  /* Gcoeff */
+    1.0000f, 1.8556f, 0.0000f, 0.0f,                    /* Bcoeff */
+};
+
+static const float mat_BT2020_Limited_10bit[] = {
+    -0.062561095f, -0.500488759f, -0.500488759f, 0.0f,  /* offset */
+    1.1678f, 0.0000f, 1.6836f, 0.0f,                    /* Rcoeff */
+    1.1678f, -0.1879f, -0.6523f, 0.0f,                  /* Gcoeff */
+    1.1678f, 2.1481f, 0.0000f, 0.0f,                    /* Bcoeff */
+};
+
+static const float mat_BT2020_Full_10bit[] = {
+    0.0f, -0.500488759f, -0.500488759f, 0.0f,           /* offset */
+    1.0000f, 0.0000f, 1.4760f, 0.0f,                    /* Rcoeff */
+    1.0000f, -0.1647f, -0.5719f, 0.0f,                  /* Gcoeff */
+    1.0000f, 1.8832f, 0.0000f, 0.0f,                    /* Bcoeff */
+};
+
+static const float *SDL_GetBT601ConversionMatrix( SDL_Colorspace colorspace )
+{
+    switch (SDL_COLORSPACERANGE(colorspace)) {
+    case SDL_COLOR_RANGE_LIMITED:
+    case SDL_COLOR_RANGE_UNKNOWN:
+        return mat_BT601_Limited_8bit;
+    case SDL_COLOR_RANGE_FULL:
+        return mat_BT601_Full_8bit;
+    default:
+        break;
+    }
+    return NULL;
+}
+
+static const float *SDL_GetBT709ConversionMatrix(SDL_Colorspace colorspace)
+{
+    switch (SDL_COLORSPACERANGE(colorspace)) {
+    case SDL_COLOR_RANGE_LIMITED:
+    case SDL_COLOR_RANGE_UNKNOWN:
+        return mat_BT709_Limited_8bit;
+    case SDL_COLOR_RANGE_FULL:
+        return mat_BT709_Full_8bit;
+    default:
+        break;
+    }
+    return NULL;
+}
+
+static const float *SDL_GetBT2020ConversionMatrix(SDL_Colorspace colorspace)
+{
+    switch (SDL_COLORSPACERANGE(colorspace)) {
+    case SDL_COLOR_RANGE_LIMITED:
+    case SDL_COLOR_RANGE_UNKNOWN:
+        return mat_BT2020_Limited_10bit;
+    case SDL_COLOR_RANGE_FULL:
+        return mat_BT2020_Full_10bit;
+    default:
+        break;
+    }
+    return NULL;
+}
+
+const float *SDL_GetYCbCRtoRGBConversionMatrix(SDL_Colorspace colorspace, int w, int h, int bits_per_pixel)
+{
+    const int YUV_SD_THRESHOLD = 576;
+
+    switch (SDL_COLORSPACEMATRIX(colorspace)) {
+    case SDL_MATRIX_COEFFICIENTS_BT601:
+        return SDL_GetBT601ConversionMatrix(colorspace);
+
+    case SDL_MATRIX_COEFFICIENTS_BT709:
+        return SDL_GetBT709ConversionMatrix(colorspace);
+
+    /* FIXME: Are these the same? */
+    case SDL_MATRIX_COEFFICIENTS_BT2020_NCL:
+    case SDL_MATRIX_COEFFICIENTS_BT2020_CL:
+        return SDL_GetBT2020ConversionMatrix(colorspace);
+
+    case SDL_MATRIX_COEFFICIENTS_UNSPECIFIED:
+        switch (bits_per_pixel) {
+        case 8:
+            if (h <= YUV_SD_THRESHOLD) {
+                return SDL_GetBT601ConversionMatrix(colorspace);
+            } else {
+                return SDL_GetBT709ConversionMatrix(colorspace);
+            }
+        case 10:
+        case 16:
+            return SDL_GetBT2020ConversionMatrix(colorspace);
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    return NULL;
 }
 
 const float *SDL_GetColorPrimariesConversionMatrix(SDL_ColorPrimaries src, SDL_ColorPrimaries dst)
@@ -769,15 +902,40 @@ const float *SDL_GetColorPrimariesConversionMatrix(SDL_ColorPrimaries src, SDL_C
     /* Conversion matrices generated using gamescope color helpers and the primaries definitions at:
      * https://www.itu.int/rec/T-REC-H.273-201612-S/en
      */
+    static const float mat601to709[] = {
+        0.939542f, 0.050181f, 0.010277f,
+        0.017772f, 0.965793f, 0.016435f,
+        -0.001622f, -0.004370f, 1.005991f,
+    };
+    static const float mat601to2020[] = {
+        0.595254f, 0.349314f, 0.055432f,
+        0.081244f, 0.891503f, 0.027253f,
+        0.015512f, 0.081912f, 0.902576f,
+    };
+    static const float mat709to601[] = {
+        1.065379f, -0.055401f, -0.009978f,
+        -0.019633f, 1.036363f, -0.016731f,
+        0.001632f, 0.004412f, 0.993956f,
+    };
     static const float mat709to2020[] = {
         0.627404f, 0.329283f, 0.043313f,
         0.069097f, 0.919541f, 0.011362f,
         0.016391f, 0.088013f, 0.895595f,
     };
+    static const float mat2020to601[] = {
+        1.776133f, -0.687820f, -0.088313f,
+        -0.161376f, 1.187315f, -0.025940f,
+        -0.015881f, -0.095931f, 1.111812f,
+    };
     static const float mat2020to709[] = {
         1.660496f, -0.587656f, -0.072840f,
         -0.124547f, 1.132895f, -0.008348f,
         -0.018154f, -0.100597f, 1.118751f
+    };
+    static const float matXYZto601[] = {
+        3.506001f, -1.739790f, -0.544058f,
+        -1.069047f, 1.977779f, 0.035171f,
+        0.056307f, -0.196976f, 1.049952f,
     };
     static const float matXYZto709[] = {
         3.240969f, -1.537383f, -0.498611f,
@@ -801,8 +959,24 @@ const float *SDL_GetColorPrimariesConversionMatrix(SDL_ColorPrimaries src, SDL_C
     };
 
     switch (dst) {
+    case SDL_COLOR_PRIMARIES_BT601:
+    case SDL_COLOR_PRIMARIES_SMPTE240:
+        switch (src) {
+        case SDL_COLOR_PRIMARIES_BT709:
+            return mat709to601;
+        case SDL_COLOR_PRIMARIES_BT2020:
+            return mat2020to601;
+        case SDL_COLOR_PRIMARIES_XYZ:
+            return matXYZto601;
+        default:
+            break;
+        }
+        break;
     case SDL_COLOR_PRIMARIES_BT709:
         switch (src) {
+        case SDL_COLOR_PRIMARIES_BT601:
+        case SDL_COLOR_PRIMARIES_SMPTE240:
+            return mat601to709;
         case SDL_COLOR_PRIMARIES_BT2020:
             return mat2020to709;
         case SDL_COLOR_PRIMARIES_XYZ:
@@ -817,6 +991,9 @@ const float *SDL_GetColorPrimariesConversionMatrix(SDL_ColorPrimaries src, SDL_C
         break;
     case SDL_COLOR_PRIMARIES_BT2020:
         switch (src) {
+        case SDL_COLOR_PRIMARIES_BT601:
+        case SDL_COLOR_PRIMARIES_SMPTE240:
+            return mat601to2020;
         case SDL_COLOR_PRIMARIES_BT709:
             return mat709to2020;
         case SDL_COLOR_PRIMARIES_XYZ:
@@ -879,7 +1056,7 @@ int SDL_SetPixelFormatPalette(SDL_PixelFormat *format, SDL_Palette *palette)
         return SDL_InvalidParamError("SDL_SetPixelFormatPalette(): format");
     }
 
-    if (palette && palette->ncolors > (1 << format->BitsPerPixel)) {
+    if (palette && palette->ncolors > (1 << format->bits_per_pixel)) {
         return SDL_SetError("SDL_SetPixelFormatPalette() passed a palette that doesn't match the format");
     }
 
@@ -1157,7 +1334,7 @@ static Uint8 *Map1toN(SDL_PixelFormat *src, Uint8 Rmod, Uint8 Gmod, Uint8 Bmod, 
     int bpp;
     SDL_Palette *pal = src->palette;
 
-    bpp = ((dst->BytesPerPixel == 3) ? 4 : dst->BytesPerPixel);
+    bpp = ((dst->bytes_per_pixel == 3) ? 4 : dst->bytes_per_pixel);
     map = (Uint8 *)SDL_calloc(256, bpp);
     if (!map) {
         return NULL;
@@ -1169,7 +1346,8 @@ static Uint8 *Map1toN(SDL_PixelFormat *src, Uint8 Rmod, Uint8 Gmod, Uint8 Bmod, 
         Uint8 G = (Uint8)((pal->colors[i].g * Gmod) / 255);
         Uint8 B = (Uint8)((pal->colors[i].b * Bmod) / 255);
         Uint8 A = (Uint8)((pal->colors[i].a * Amod) / 255);
-        ASSEMBLE_RGBA(&map[i * bpp], dst->BytesPerPixel, dst, (Uint32)R, (Uint32)G, (Uint32)B, (Uint32)A);
+        ASSEMBLE_RGBA(&map[i * bpp], dst->bytes_per_pixel, dst, (Uint32)R,
+                      (Uint32)G, (Uint32)B, (Uint32)A);
     }
     return map;
 }
@@ -1265,7 +1443,7 @@ int SDL_MapSurface(SDL_Surface *src, SDL_Surface *dst)
                     return -1;
                 }
             }
-            if (srcfmt->BitsPerPixel != dstfmt->BitsPerPixel) {
+            if (srcfmt->bits_per_pixel != dstfmt->bits_per_pixel) {
                 map->identity = 0;
             }
         } else {

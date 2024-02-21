@@ -1497,8 +1497,6 @@ SDL_bool SDLTest_CommonInit(SDLTest_CommonState *state)
                 }
             }
 
-            SDL_ShowWindow(state->windows[i]);
-
             if (!SDL_RectEmpty(&state->confine)) {
                 SDL_SetWindowMouseRect(state->windows[i], &state->confine);
             }
@@ -1530,6 +1528,8 @@ SDL_bool SDLTest_CommonInit(SDLTest_CommonState *state)
                     SDLTest_PrintRenderer(&info);
                 }
             }
+
+            SDL_ShowWindow(state->windows[i]);
         }
     }
 
@@ -1565,6 +1565,10 @@ SDL_bool SDLTest_CommonInit(SDLTest_CommonState *state)
             SDL_Log("Couldn't open audio: %s\n", SDL_GetError());
             return SDL_FALSE;
         }
+    }
+
+    if (state->flags & SDL_INIT_CAMERA) {
+        SDL_InitSubSystem(SDL_INIT_CAMERA);
     }
 
     return SDL_TRUE;
@@ -1664,6 +1668,12 @@ static void SDLTest_PrintEvent(const SDL_Event *event)
             float scale = SDL_GetDisplayContentScale(event->display.displayID);
             SDL_Log("SDL EVENT: Display %" SDL_PRIu32 " changed content scale to %d%%",
                     event->display.displayID, (int)(scale * 100.0f));
+        }
+        break;
+    case SDL_EVENT_DISPLAY_HDR_STATE_CHANGED:
+        {
+            SDL_Log("SDL EVENT: Display %" SDL_PRIu32 " HDR %s",
+                    event->display.displayID, event->display.data1 ? "enabled" : "disabled");
         }
         break;
     case SDL_EVENT_DISPLAY_MOVED:
@@ -1884,8 +1894,8 @@ static void SDLTest_PrintEvent(const SDL_Event *event)
 
     case SDL_EVENT_FINGER_MOTION:
         SDL_Log("SDL EVENT: Finger: motion touch=%" SDL_PRIu64 ", finger=%" SDL_PRIu64 ", x=%f, y=%f, dx=%f, dy=%f, pressure=%f",
-                event->tfinger.touchId,
-                event->tfinger.fingerId,
+                event->tfinger.touchID,
+                event->tfinger.fingerID,
                 event->tfinger.x, event->tfinger.y,
                 event->tfinger.dx, event->tfinger.dy, event->tfinger.pressure);
         break;
@@ -1893,8 +1903,8 @@ static void SDLTest_PrintEvent(const SDL_Event *event)
     case SDL_EVENT_FINGER_UP:
         SDL_Log("SDL EVENT: Finger: %s touch=%" SDL_PRIu64 ", finger=%" SDL_PRIu64 ", x=%f, y=%f, dx=%f, dy=%f, pressure=%f",
                 (event->type == SDL_EVENT_FINGER_DOWN) ? "down" : "up",
-                event->tfinger.touchId,
-                event->tfinger.fingerId,
+                event->tfinger.touchID,
+                event->tfinger.fingerID,
                 event->tfinger.x, event->tfinger.y,
                 event->tfinger.dx, event->tfinger.dy, event->tfinger.pressure);
         break;
@@ -2016,7 +2026,6 @@ static const void *SDLTest_ScreenShotClipboardProvider(void *context, const char
 
 static void SDLTest_CopyScreenShot(SDL_Renderer *renderer)
 {
-    SDL_Rect viewport;
     SDL_Surface *surface;
     const char *image_formats[] = {
         "text/plain;charset=utf-8",
@@ -2028,28 +2037,18 @@ static void SDLTest_CopyScreenShot(SDL_Renderer *renderer)
         return;
     }
 
-    SDL_GetRenderViewport(renderer, &viewport);
-
-    surface = SDL_CreateSurface(viewport.w, viewport.h, SDL_PIXELFORMAT_BGR24);
-
+    surface = SDL_RenderReadPixels(renderer, NULL);
     if (!surface) {
-        SDL_Log("Couldn't create surface: %s\n", SDL_GetError());
-        return;
-    }
-
-    if (SDL_RenderReadPixels(renderer, NULL, surface->format->format,
-                             surface->pixels, surface->pitch) < 0) {
         SDL_Log("Couldn't read screen: %s\n", SDL_GetError());
-        SDL_free(surface);
         return;
     }
 
     if (SDL_SaveBMP(surface, SCREENSHOT_FILE) < 0) {
         SDL_Log("Couldn't save %s: %s\n", SCREENSHOT_FILE, SDL_GetError());
-        SDL_free(surface);
+        SDL_DestroySurface(surface);
         return;
     }
-    SDL_free(surface);
+    SDL_DestroySurface(surface);
 
     clipboard_data = (SDLTest_ClipboardData *)SDL_calloc(1, sizeof(*clipboard_data));
     if (!clipboard_data) {
@@ -2566,6 +2565,9 @@ void SDLTest_CommonQuit(SDLTest_CommonState *state)
             SDL_DestroyWindow(state->windows[i]);
         }
         SDL_free(state->windows);
+    }
+    if (state->flags & SDL_INIT_CAMERA) {
+        SDL_QuitSubSystem(SDL_INIT_CAMERA);
     }
     if (state->flags & SDL_INIT_VIDEO) {
         SDL_QuitSubSystem(SDL_INIT_VIDEO);

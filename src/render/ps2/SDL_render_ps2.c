@@ -20,7 +20,7 @@
 */
 #include "SDL_internal.h"
 
-#ifdef SDL_VIDEO_RENDER_PS2
+#if SDL_VIDEO_RENDER_PS2
 
 #include "../SDL_sysrender.h"
 
@@ -103,22 +103,22 @@ static int PixelFormatToPS2PSM(Uint32 format)
     }
 }
 
-static gs_rgbaq float_color_to_RGBAQ(const SDL_FColor *color)
+static gs_rgbaq float_color_to_RGBAQ(const SDL_FColor *color, float color_scale)
 {
-    uint8_t colorR = (uint8_t)SDL_roundf(color->r * 255.0f);
-    uint8_t colorG = (uint8_t)SDL_roundf(color->g * 255.0f);
-    uint8_t colorB = (uint8_t)SDL_roundf(color->b * 255.0f);
-    uint8_t colorA = (uint8_t)SDL_roundf(color->a * 255.0f);
+    uint8_t colorR = (uint8_t)SDL_roundf(SDL_clamp(color->r * color_scale, 0.0f, 1.0f) * 255.0f);
+    uint8_t colorG = (uint8_t)SDL_roundf(SDL_clamp(color->g * color_scale, 0.0f, 1.0f) * 255.0f);
+    uint8_t colorB = (uint8_t)SDL_roundf(SDL_clamp(color->b * color_scale, 0.0f, 1.0f) * 255.0f);
+    uint8_t colorA = (uint8_t)SDL_roundf(SDL_clamp(color->a, 0.0f, 1.0f) * 255.0f);
 
     return color_to_RGBAQ(colorR, colorG, colorB, colorA, 0x00);
 }
 
-static uint64_t float_GS_SETREG_RGBAQ(const SDL_FColor *color)
+static uint64_t float_GS_SETREG_RGBAQ(const SDL_FColor *color, float color_scale)
 {
-    uint8_t colorR = (uint8_t)SDL_roundf(color->r * 255.0f);
-    uint8_t colorG = (uint8_t)SDL_roundf(color->g * 255.0f);
-    uint8_t colorB = (uint8_t)SDL_roundf(color->b * 255.0f);
-    uint8_t colorA = (uint8_t)SDL_roundf(color->a * 255.0f);
+    uint8_t colorR = (uint8_t)SDL_roundf(SDL_clamp(color->r * color_scale, 0.0f, 1.0f) * 255.0f);
+    uint8_t colorG = (uint8_t)SDL_roundf(SDL_clamp(color->g * color_scale, 0.0f, 1.0f) * 255.0f);
+    uint8_t colorB = (uint8_t)SDL_roundf(SDL_clamp(color->b * color_scale, 0.0f, 1.0f) * 255.0f);
+    uint8_t colorA = (uint8_t)SDL_roundf(SDL_clamp(color->a, 0.0f, 1.0f) * 255.0f);
 
     return GS_SETREG_RGBAQ(colorR, colorG, colorB, colorA, 0x00);
 }
@@ -228,7 +228,7 @@ static int PS2_QueueSetViewport(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
     return 0;
 }
 
-static int PS2_QueueSetDrawColor(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
+static int PS2_QueueNoOp(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
 {
     return 0; /* nothing to do in this backend. */
 }
@@ -246,7 +246,7 @@ static int PS2_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd, c
 
     cmd->data.draw.count = count;
 
-    rgbaq = float_color_to_RGBAQ(&cmd->data.draw.color);
+    rgbaq = float_color_to_RGBAQ(&cmd->data.draw.color, cmd->data.draw.color_scale);
 
     for (i = 0; i < count; i++, vertices++, points++) {
         vertices->xyz2 = vertex_to_XYZ2(data->gsGlobal, points->x, points->y, 0);
@@ -263,6 +263,7 @@ static int PS2_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, SDL
     int i;
     int count = indices ? num_indices : num_vertices;
     PS2_RenderData *data = (PS2_RenderData *)renderer->driverdata;
+    const float color_scale = cmd->data.draw.color_scale;
 
     cmd->data.draw.count = count;
     size_indices = indices ? size_indices : 0;
@@ -295,7 +296,7 @@ static int PS2_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, SDL
             uv_ = (float *)((char *)uv + j * uv_stride);
 
             vertices->xyz2 = vertex_to_XYZ2(data->gsGlobal, xy_[0] * scale_x, xy_[1] * scale_y, 0);
-            vertices->rgbaq = float_color_to_RGBAQ(col_);
+            vertices->rgbaq = float_color_to_RGBAQ(col_, color_scale);
             vertices->uv = vertex_to_UV(ps2_tex, uv_[0] * ps2_tex->Width, uv_[1] * ps2_tex->Height);
 
             vertices++;
@@ -326,7 +327,7 @@ static int PS2_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, SDL
             col_ = (SDL_FColor *)((char *)color + j * color_stride);
 
             vertices->xyz2 = vertex_to_XYZ2(data->gsGlobal, xy_[0] * scale_x, xy_[1] * scale_y, 0);
-            vertices->rgbaq = float_color_to_RGBAQ(col_);
+            vertices->rgbaq = float_color_to_RGBAQ(col_, color_scale);
 
             vertices++;
         }
@@ -363,7 +364,7 @@ static int PS2_RenderSetDrawColor(SDL_Renderer *renderer, SDL_RenderCommand *cmd
 {
     PS2_RenderData *data = (PS2_RenderData *)renderer->driverdata;
 
-    data->drawColor = float_GS_SETREG_RGBAQ(&cmd->data.color.color);
+    data->drawColor = float_GS_SETREG_RGBAQ(&cmd->data.color.color, cmd->data.color.color_scale);
     return 0;
 }
 
@@ -381,7 +382,7 @@ static int PS2_RenderClear(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
     offsetY = data->gsGlobal->OffsetY;
     data->gsGlobal->OffsetX = (int)(2048.0f * 16.0f);
     data->gsGlobal->OffsetY = (int)(2048.0f * 16.0f);
-    gsKit_clear(data->gsGlobal, float_GS_SETREG_RGBAQ(&cmd->data.color.color));
+    gsKit_clear(data->gsGlobal, float_GS_SETREG_RGBAQ(&cmd->data.color.color, cmd->data.color.color_scale));
 
     /* Put back original offset */
     data->gsGlobal->OffsetX = offsetX;
@@ -503,6 +504,10 @@ static int PS2_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, v
             PS2_RenderSetDrawColor(renderer, cmd);
             break;
         }
+        case SDL_RENDERCMD_SETCOLORSCALE:
+        {
+            break;
+        }
         case SDL_RENDERCMD_CLEAR:
         {
             PS2_RenderClear(renderer, cmd);
@@ -535,12 +540,6 @@ static int PS2_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, v
         cmd = cmd->next;
     }
     return 0;
-}
-
-static int PS2_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
-                                Uint32 format, void *pixels, int pitch)
-{
-    return SDL_Unsupported();
 }
 
 static int PS2_RenderPresent(SDL_Renderer *renderer)
@@ -613,7 +612,7 @@ static void PS2_DestroyRenderer(SDL_Renderer *renderer)
 static int PS2_SetVSync(SDL_Renderer *renderer, const int vsync)
 {
     PS2_RenderData *data = (PS2_RenderData *)renderer->driverdata;
-    SDL_bool dynamicVsync = SDL_GetHintBoolean(SDL_HINT_PS2_DYNAMIC_VSYNC, SDL_FALSE);
+    SDL_bool dynamicVsync = SDL_GetHintBoolean(SDL_HINT_RENDER_PS2_DYNAMIC_VSYNC, SDL_FALSE);
     data->vsync = vsync ? (dynamicVsync ? 2 : 1) : 0;
     return 0;
 }
@@ -684,7 +683,7 @@ static SDL_Renderer *PS2_CreateRenderer(SDL_Window *window, SDL_PropertiesID cre
     gsKit_clear(gsGlobal, GS_BLACK);
 
     data->gsGlobal = gsGlobal;
-    dynamicVsync = SDL_GetHintBoolean(SDL_HINT_PS2_DYNAMIC_VSYNC, SDL_FALSE);
+    dynamicVsync = SDL_GetHintBoolean(SDL_HINT_RENDER_PS2_DYNAMIC_VSYNC, SDL_FALSE);
     if (SDL_GetBooleanProperty(create_props, SDL_PROP_RENDERER_CREATE_PRESENT_VSYNC_BOOLEAN, SDL_FALSE)) {
         data->vsync = (dynamicVsync ? 2 : 1);
     }
@@ -697,13 +696,13 @@ static SDL_Renderer *PS2_CreateRenderer(SDL_Window *window, SDL_PropertiesID cre
     renderer->SetTextureScaleMode = PS2_SetTextureScaleMode;
     renderer->SetRenderTarget = PS2_SetRenderTarget;
     renderer->QueueSetViewport = PS2_QueueSetViewport;
-    renderer->QueueSetDrawColor = PS2_QueueSetDrawColor;
+    renderer->QueueSetDrawColor = PS2_QueueNoOp;
+    renderer->QueueSetColorScale = PS2_QueueNoOp;
     renderer->QueueDrawPoints = PS2_QueueDrawPoints;
     renderer->QueueDrawLines = PS2_QueueDrawPoints;
     renderer->QueueGeometry = PS2_QueueGeometry;
     renderer->InvalidateCachedState = PS2_InvalidateCachedState;
     renderer->RunCommandQueue = PS2_RunCommandQueue;
-    renderer->RenderReadPixels = PS2_RenderReadPixels;
     renderer->RenderPresent = PS2_RenderPresent;
     renderer->DestroyTexture = PS2_DestroyTexture;
     renderer->DestroyRenderer = PS2_DestroyRenderer;

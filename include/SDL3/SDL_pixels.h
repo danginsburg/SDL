@@ -165,7 +165,9 @@ typedef enum
     (SDL_ISPIXELFORMAT_FOURCC(X) ? \
         ((((X) == SDL_PIXELFORMAT_YUY2) || \
           ((X) == SDL_PIXELFORMAT_UYVY) || \
-          ((X) == SDL_PIXELFORMAT_YVYU)) ? 2 : 1) : (((X) >> 0) & 0xFF))
+          ((X) == SDL_PIXELFORMAT_YVYU) || \
+          ((X) == SDL_PIXELFORMAT_P010) || \
+          ((X) == SDL_PIXELFORMAT_P016)) ? 2 : 1) : (((X) >> 0) & 0xFF))
 
 #define SDL_ISPIXELFORMAT_INDEXED(format)   \
     (!SDL_ISPIXELFORMAT_FOURCC(format) && \
@@ -414,6 +416,10 @@ typedef enum
         SDL_DEFINE_PIXELFOURCC('N', 'V', '1', '2'),
     SDL_PIXELFORMAT_NV21 =      /**< Planar mode: Y + V/U interleaved  (2 planes) */
         SDL_DEFINE_PIXELFOURCC('N', 'V', '2', '1'),
+    SDL_PIXELFORMAT_P010 =      /**< Planar mode: Y + U/V interleaved  (2 planes) */
+        SDL_DEFINE_PIXELFOURCC('P', '0', '1', '0'),
+    SDL_PIXELFORMAT_P016 =      /**< Planar mode: Y + U/V interleaved  (2 planes) */
+        SDL_DEFINE_PIXELFOURCC('P', '0', '1', '6'),
     SDL_PIXELFORMAT_EXTERNAL_OES =      /**< Android video texture format */
         SDL_DEFINE_PIXELFOURCC('O', 'E', 'S', ' ')
 } SDL_PixelFormatEnum;
@@ -555,9 +561,16 @@ typedef enum
 #define SDL_COLORSPACETRANSFER(X)   (SDL_TransferCharacteristics)(((X) >> 5) & 0x1F)
 #define SDL_COLORSPACEMATRIX(X)     (SDL_MatrixCoefficients)((X) & 0x1F)
 
+#define SDL_ISCOLORSPACE_YUV_BT601(X)       (SDL_COLORSPACEMATRIX(X) == SDL_MATRIX_COEFFICIENTS_BT601 || SDL_COLORSPACEMATRIX(X) == SDL_MATRIX_COEFFICIENTS_BT470BG)
+#define SDL_ISCOLORSPACE_YUV_BT709(X)       (SDL_COLORSPACEMATRIX(X) == SDL_MATRIX_COEFFICIENTS_BT709)
+#define SDL_ISCOLORSPACE_LIMITED_RANGE(X)   (SDL_COLORSPACERANGE(X) == SDL_COLOR_RANGE_LIMITED)
+#define SDL_ISCOLORSPACE_FULL_RANGE(X)      (SDL_COLORSPACERANGE(X) == SDL_COLOR_RANGE_LIMITED)
+
 typedef enum
 {
     SDL_COLORSPACE_UNKNOWN,
+
+    /* sRGB is a gamma corrected colorspace, and the default colorspace for SDL rendering and 8-bit RGB surfaces */
     SDL_COLORSPACE_SRGB =   /**< Equivalent to DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 */
         SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_RGB,
                               SDL_COLOR_RANGE_FULL,
@@ -565,6 +578,8 @@ typedef enum
                               SDL_TRANSFER_CHARACTERISTICS_SRGB,
                               SDL_MATRIX_COEFFICIENTS_UNSPECIFIED,
                               SDL_CHROMA_LOCATION_NONE),
+
+    /* scRGB is a linear colorspace and the default colorspace for floating point surfaces */
     SDL_COLORSPACE_SCRGB =   /**< Equivalent to DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709  */
         SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_RGB,
                               SDL_COLOR_RANGE_FULL,
@@ -572,6 +587,8 @@ typedef enum
                               SDL_TRANSFER_CHARACTERISTICS_LINEAR,
                               SDL_MATRIX_COEFFICIENTS_UNSPECIFIED,
                               SDL_CHROMA_LOCATION_NONE),
+
+    /* HDR10 is a non-linear HDR colorspace and the default colorspace for 10-bit surfaces */
     SDL_COLORSPACE_HDR10 =   /**< Equivalent to DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020  */
         SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_RGB,
                               SDL_COLOR_RANGE_FULL,
@@ -579,6 +596,15 @@ typedef enum
                               SDL_TRANSFER_CHARACTERISTICS_PQ,
                               SDL_MATRIX_COEFFICIENTS_UNSPECIFIED,
                               SDL_CHROMA_LOCATION_NONE),
+
+    SDL_COLORSPACE_JPEG =     /**< Equivalent to DXGI_COLOR_SPACE_YCBCR_FULL_G22_NONE_P709_X601 */
+        SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_YCBCR,
+                              SDL_COLOR_RANGE_FULL,
+                              SDL_COLOR_PRIMARIES_BT709,
+                              SDL_TRANSFER_CHARACTERISTICS_BT601,
+                              SDL_MATRIX_COEFFICIENTS_BT601,
+                              SDL_CHROMA_LOCATION_NONE),
+
     SDL_COLORSPACE_BT601_LIMITED =  /**< Equivalent to DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601 */
         SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_YCBCR,
                               SDL_COLOR_RANGE_LIMITED,
@@ -586,6 +612,7 @@ typedef enum
                               SDL_TRANSFER_CHARACTERISTICS_BT601,
                               SDL_MATRIX_COEFFICIENTS_BT601,
                               SDL_CHROMA_LOCATION_LEFT),
+
     SDL_COLORSPACE_BT601_FULL =     /**< Equivalent to DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601 */
         SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_YCBCR,
                               SDL_COLOR_RANGE_FULL,
@@ -593,6 +620,7 @@ typedef enum
                               SDL_TRANSFER_CHARACTERISTICS_BT601,
                               SDL_MATRIX_COEFFICIENTS_BT601,
                               SDL_CHROMA_LOCATION_LEFT),
+
     SDL_COLORSPACE_BT709_LIMITED =  /**< Equivalent to DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709 */
         SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_YCBCR,
                               SDL_COLOR_RANGE_LIMITED,
@@ -600,6 +628,7 @@ typedef enum
                               SDL_TRANSFER_CHARACTERISTICS_BT709,
                               SDL_MATRIX_COEFFICIENTS_BT709,
                               SDL_CHROMA_LOCATION_LEFT),
+
     SDL_COLORSPACE_BT709_FULL =     /**< Equivalent to DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709 */
         SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_YCBCR,
                               SDL_COLOR_RANGE_FULL,
@@ -608,8 +637,28 @@ typedef enum
                               SDL_MATRIX_COEFFICIENTS_BT709,
                               SDL_CHROMA_LOCATION_LEFT),
 
+    SDL_COLORSPACE_BT2020_LIMITED =  /**< Equivalent to DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020 */
+        SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_YCBCR,
+                              SDL_COLOR_RANGE_LIMITED,
+                              SDL_COLOR_PRIMARIES_BT2020,
+                              SDL_TRANSFER_CHARACTERISTICS_PQ,
+                              SDL_MATRIX_COEFFICIENTS_BT2020_NCL,
+                              SDL_CHROMA_LOCATION_LEFT),
+
+    SDL_COLORSPACE_BT2020_FULL =     /**< Equivalent to DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020 */
+        SDL_DEFINE_COLORSPACE(SDL_COLOR_TYPE_YCBCR,
+                              SDL_COLOR_RANGE_FULL,
+                              SDL_COLOR_PRIMARIES_BT2020,
+                              SDL_TRANSFER_CHARACTERISTICS_PQ,
+                              SDL_MATRIX_COEFFICIENTS_BT2020_NCL,
+                              SDL_CHROMA_LOCATION_LEFT),
+
     /* The default colorspace for RGB surfaces if no colorspace is specified */
     SDL_COLORSPACE_RGB_DEFAULT = SDL_COLORSPACE_SRGB,
+
+    /* The default colorspace for YUV surfaces if no colorspace is specified */
+    SDL_COLORSPACE_YUV_DEFAULT = SDL_COLORSPACE_JPEG,
+
 } SDL_Colorspace;
 
 /**
@@ -654,8 +703,8 @@ typedef struct SDL_PixelFormat
 {
     Uint32 format;
     SDL_Palette *palette;
-    Uint8 BitsPerPixel;
-    Uint8 BytesPerPixel;
+    Uint8 bits_per_pixel;
+    Uint8 bytes_per_pixel;
     Uint8 padding[2];
     Uint32 Rmask;
     Uint32 Gmask;
