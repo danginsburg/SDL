@@ -365,6 +365,7 @@ static void VULKAN_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture);
 static void VULKAN_DestroyBuffer(VULKAN_RenderData *rendererData, VULKAN_Buffer *vulkanBuffer);
 static void VULKAN_DestroyImage(VULKAN_RenderData *rendererData, VULKAN_Image *vulkanImage);
 static void VULKAN_ResetCommandList(VULKAN_RenderData *rendererData);
+static SDL_bool VULKAN_FindMemoryTypeIndex(VULKAN_RenderData *rendererData, uint32_t typeBits, VkMemoryPropertyFlags flags, uint32_t *memoryTypeIndexOut);
 
 static void VULKAN_DestroyAll(SDL_Renderer *renderer)
 {
@@ -396,7 +397,7 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
                 rendererData->fences[i] = VK_NULL_HANDLE;
             }
         }
-        SDL_free( rendererData->fences );
+        SDL_free(rendererData->fences);
         rendererData->fences = NULL;
     }
     if (rendererData->swapchainImageViews) {
@@ -439,11 +440,11 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
     }
     if (rendererData->imageAvailableSemaphore != VK_NULL_HANDLE) {
         vkDestroySemaphore(rendererData->device, rendererData->imageAvailableSemaphore, NULL);
-        rendererData->imageAvailableSemaphore = NULL;
+        rendererData->imageAvailableSemaphore = VK_NULL_HANDLE;
     }
     if (rendererData->renderingFinishedSemaphore != VK_NULL_HANDLE) {
         vkDestroySemaphore(rendererData->device, rendererData->renderingFinishedSemaphore, NULL);
-        rendererData->renderingFinishedSemaphore = NULL;
+        rendererData->renderingFinishedSemaphore = VK_NULL_HANDLE;
     }
     if (rendererData->commandPool) {
         if (rendererData->commandBuffers) {
@@ -726,7 +727,8 @@ static VkResult VULKAN_AcquireNextSwapchainImage(VULKAN_RenderData *rendererData
 
     if (result != VK_SUCCESS) {
         //@TEMP - TODO: Handle out-of-date, suboptimal, etc.
-        return SDL_FALSE;
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkAcquireNextImageKHR(): %s\n", SDL_Vulkan_GetResultString(result));
+        return result;
     }
 
     return result;
@@ -876,12 +878,11 @@ static VkResult VULKAN_IssueBatch(VULKAN_RenderData *rendererData)
 
     vkEndCommandBuffer(rendererData->currentCommandBuffer);
 
-    VkPipelineStageFlags waitDestStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submitInfo = { 0 };
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &rendererData->currentCommandBuffer;
-    result = vkQueueSubmit(rendererData->graphicsQueue, 1, &submitInfo, NULL);
+    result = vkQueueSubmit(rendererData->graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
 
     VULKAN_WaitForGPU(rendererData);
 
@@ -1391,6 +1392,34 @@ static VkSemaphore VULKAN_CreateSemaphore(VULKAN_RenderData *rendererData)
     return semaphore;
 }
 
+static SDL_bool VULKAN_InstanceExtensionFound(VULKAN_RenderData *rendererData, const char *extName)
+{
+    uint32_t extensionCount;
+    VkResult result = vkEnumerateInstanceExtensionProperties(NULL, &extensionCount, NULL);
+    if (result != VK_SUCCESS ) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkEnumerateInstanceExtensionProperties( NULL, ... ): %s.\n", SDL_Vulkan_GetResultString(result));
+        return SDL_FALSE;
+    }
+    if (extensionCount > 0 ) {
+        VkExtensionProperties *extensionProperties = SDL_calloc(sizeof(VkExtensionProperties), extensionCount);
+        result = vkEnumerateInstanceExtensionProperties(NULL, &extensionCount, extensionProperties);
+        if (result != VK_SUCCESS ) {
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkEnumerateInstanceExtensionProperties( NULL, ... ): %s.\n", SDL_Vulkan_GetResultString(result));
+            SDL_free(extensionProperties);
+            return SDL_FALSE;
+        }
+        for (uint32_t i = 0; i< extensionCount; i++) {
+            if (SDL_strcmp(extensionProperties[i].extensionName, extName) == 0) {
+                SDL_free(extensionProperties);
+                return SDL_TRUE;
+            }
+        }
+        SDL_free(extensionProperties);
+    }
+
+    return SDL_FALSE;
+}
+
 static SDL_bool VULKAN_ValidationLayersFound()
 {
     const char *validationLayerName = "VK_LAYER_KHRONOS_validation";
@@ -1451,7 +1480,10 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
 
     if (renderer->output_colorspace == SDL_COLORSPACE_SCRGB ||
         renderer->output_colorspace == SDL_COLORSPACE_HDR10) {
-        rendererData->supportsEXTSwapchainColorspace = VK_TRUE;
+        rendererData->supportsEXTSwapchainColorspace = VULKAN_InstanceExtensionFound(rendererData, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+        if (rendererData->supportsEXTSwapchainColorspace == SDL_FALSE) {
+            return SDL_SetError("[Vulkan] Using HDR output but %s not supported.", VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+        }
     }
     char **instanceExtensionsCopy = SDL_calloc(sizeof(const char *), instanceCreateInfo.enabledExtensionCount + 1);
     for (uint32_t i = 0; i < instanceCreateInfo.enabledExtensionCount; i++) {
@@ -2187,7 +2219,7 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
         return result;
     }
     
-    SDL_SetProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_VULKAN_TEXTURE_POINTER, textureData->mainImage.image);
+    SDL_SetProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_VULKAN_TEXTURE_POINTER, (void*) textureData->mainImage.image);
 
 
 #if SDL_HAVE_YUV
@@ -2210,7 +2242,7 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
             SDL_LogError(SDL_LOG_CATEGORY_RENDER, "VULKAN_AllocateImage(): %s\n", SDL_Vulkan_GetResultString(result));
             return result;
         }
-        SDL_SetProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_VULKAN_TEXTURE_U_POINTER, textureData->mainImageU.image);
+        SDL_SetProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_VULKAN_TEXTURE_U_POINTER, ( void* ) textureData->mainImageU.image);
 
         /* Create V image */
         if (GetTextureProperty(create_props, "vulkan.texture_v", &externalImage) < 0) {
@@ -2222,7 +2254,7 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
             SDL_LogError(SDL_LOG_CATEGORY_RENDER, "VULKAN_AllocateImage(): %s\n", SDL_Vulkan_GetResultString(result));
             return result;
         }
-        SDL_SetProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_VULKAN_TEXTURE_V_POINTER, textureData->mainImageV.image);
+        SDL_SetProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_VULKAN_TEXTURE_V_POINTER, ( void* ) textureData->mainImageV.image);
     }
     else if (texture->format == SDL_PIXELFORMAT_NV12 || texture->format == SDL_PIXELFORMAT_NV21) {
         textureData->nv12 = SDL_TRUE;
@@ -2914,7 +2946,7 @@ static SDL_bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderComm
         descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         descriptorWrites[0].pImageInfo = &samplerDescriptor;
 
-        for (int i = 0; i < imageViewCount; i++) {
+        for (i = 0; i < imageViewCount; i++) {
             imageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             imageDescriptors[i].imageView = imageViews[i];
             descriptorWrites[i+1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
