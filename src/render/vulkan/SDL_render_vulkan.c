@@ -268,8 +268,8 @@ typedef struct
     VertexShaderConstants vertexShaderConstantsData;
 
     /* Data for staging/allocating textures */
-    VULKAN_Buffer uploadBuffers[SDL_VULKAN_NUM_UPLOAD_BUFFERS];
-    int currentUploadBuffer;
+    VULKAN_Buffer **uploadBuffers;
+    int *currentUploadBuffer;
 
     VkSampler samplers[SDL_VULKAN_NUM_SAMPLERS];
     VkDescriptorPool *descriptorPools;
@@ -290,6 +290,7 @@ typedef struct
     VkImageView *swapchainImageViews;
     VkImageLayout *swapchainImageLayouts;
     VkSemaphore imageAvailableSemaphore;
+    VkSemaphore renderingFinishedSemaphore;
     uint32_t currentSwapchainImageIndex;
     
     /* Cached renderer properties */
@@ -436,9 +437,13 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
             rendererData->renderPasses[i] = VK_NULL_HANDLE;
         }
     }
-    if (rendererData->imageAvailableSemaphore) {
+    if (rendererData->imageAvailableSemaphore != VK_NULL_HANDLE) {
         vkDestroySemaphore(rendererData->device, rendererData->imageAvailableSemaphore, NULL);
         rendererData->imageAvailableSemaphore = NULL;
+    }
+    if (rendererData->renderingFinishedSemaphore != VK_NULL_HANDLE) {
+        vkDestroySemaphore(rendererData->device, rendererData->renderingFinishedSemaphore, NULL);
+        rendererData->renderingFinishedSemaphore = NULL;
     }
     if (rendererData->commandPool) {
         if (rendererData->commandBuffers) {
@@ -482,11 +487,17 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
     SDL_free(rendererData->pipelineStates);
     rendererData->pipelineStateCount = 0;
 
-    for (uint32_t i = 0; i < rendererData->currentUploadBuffer; ++i) {
-        VULKAN_DestroyBuffer(rendererData, &rendererData->uploadBuffers[i]);
+    if (rendererData->currentUploadBuffer) {
+        for (uint32_t i = 0; i < rendererData->swapchainImageCount; ++i) {
+            for (uint32_t j = 0; j < rendererData->currentUploadBuffer[i]; ++j) {
+                VULKAN_DestroyBuffer(rendererData, &rendererData->uploadBuffers[i][j]);
+            }
+            SDL_free(rendererData->uploadBuffers[i]);
+        }
+        SDL_free(rendererData->uploadBuffers);
+        SDL_free(rendererData->currentUploadBuffer);
     }
-    rendererData->currentUploadBuffer = 0;
-
+    
     if (rendererData->device != VK_NULL_HANDLE) {
         vkDestroyDevice(rendererData->device, NULL);
         rendererData->device = VK_NULL_HANDLE;
@@ -842,10 +853,10 @@ static void VULKAN_ResetCommandList(VULKAN_RenderData *rendererData)
     rendererData->currentDescriptorSetIndex = 0;
 
     /* Release any upload buffers that were inflight */
-    for (uint32_t i = 0; i < rendererData->currentUploadBuffer; ++i) {
-        VULKAN_DestroyBuffer(rendererData, &rendererData->uploadBuffers[i]);
+    for (uint32_t i = 0; i < rendererData->currentUploadBuffer[rendererData->currentCommandBufferIndex]; ++i) {
+        VULKAN_DestroyBuffer(rendererData, &rendererData->uploadBuffers[rendererData->currentCommandBufferIndex][i]);
     }
-    rendererData->currentUploadBuffer = 0;
+    rendererData->currentUploadBuffer[rendererData->currentCommandBufferIndex] = 0;
 }
 
 static VkResult VULKAN_IssueBatch(VULKAN_RenderData *rendererData)
@@ -2033,7 +2044,31 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
         VULKAN_DestroyAll(renderer);
         return VK_ERROR_UNKNOWN;
     }
-    
+    if (rendererData->renderingFinishedSemaphore != VK_NULL_HANDLE) {
+        vkDestroySemaphore(rendererData->device, rendererData->renderingFinishedSemaphore, NULL);
+    }
+    rendererData->renderingFinishedSemaphore = VULKAN_CreateSemaphore(rendererData);
+    if (rendererData->renderingFinishedSemaphore == VK_NULL_HANDLE) {
+        VULKAN_DestroyAll(renderer);
+        return VK_ERROR_UNKNOWN;
+    }
+
+    /* Upload buffers */
+    if (rendererData->uploadBuffers) {
+        for (uint32_t i = 0; i < rendererData->swapchainImageCount; i++) {
+            for (uint32_t j = 0; j < SDL_VULKAN_NUM_UPLOAD_BUFFERS; j++) {
+                VULKAN_DestroyBuffer(rendererData, &rendererData->uploadBuffers[i][j]);
+            }
+            SDL_free(rendererData->uploadBuffers[i]);
+        }
+        SDL_free(rendererData->uploadBuffers);
+    }
+    rendererData->uploadBuffers = SDL_calloc(sizeof(VULKAN_Buffer*), rendererData->swapchainImageCount);
+    for (uint32_t i = 0; i < rendererData->swapchainImageCount; i++) {
+        rendererData->uploadBuffers[i] = SDL_calloc(sizeof(VULKAN_Buffer), SDL_VULKAN_NUM_UPLOAD_BUFFERS);
+    }
+    SDL_free(rendererData->currentUploadBuffer);
+    rendererData->currentUploadBuffer = SDL_calloc(sizeof(int), rendererData->swapchainImageCount);
 
     VULKAN_AcquireNextSwapchainImage(rendererData);
     
@@ -2049,6 +2084,7 @@ static VkResult VULKAN_CreateWindowSizeDependentResources(SDL_Renderer *renderer
 
     /* Release resources in the current command list */
     VULKAN_IssueBatch(rendererData);
+    VULKAN_WaitForGPU(rendererData);
 
     /* The width and height of the swap chain must be based on the display's
      * non-rotated size.
@@ -2241,6 +2277,7 @@ static void VULKAN_DestroyTexture(SDL_Renderer *renderer,
     /* Because SDL_DestroyTexture might be called while the data is in-flight, we need to issue the batch first
        Unfortunately, this means that deleting a lot of textures mid-frame will have poor performance. */
     VULKAN_IssueBatch(rendererData);
+    VULKAN_WaitForGPU(rendererData);
 
     VULKAN_DestroyImage(rendererData, &textureData->mainImage);
     
@@ -2277,7 +2314,8 @@ static VkResult VULKAN_UpdateTextureInternal(VULKAN_RenderData *rendererData, Vk
 
     VULKAN_EnsureCommandBuffer(rendererData);
 
-    VULKAN_Buffer *uploadBuffer = &rendererData->uploadBuffers[rendererData->currentUploadBuffer];
+    int currentUploadBufferIndex = rendererData->currentUploadBuffer[rendererData->currentCommandBufferIndex];
+    VULKAN_Buffer *uploadBuffer = &rendererData->uploadBuffers[rendererData->currentCommandBufferIndex][currentUploadBufferIndex];
 
     result = VULKAN_AllocateBuffer(rendererData, uploadBufferSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -2341,10 +2379,10 @@ static VkResult VULKAN_UpdateTextureInternal(VULKAN_RenderData *rendererData, Vk
         image,
         imageLayout);
 
-    rendererData->currentUploadBuffer++;
+    rendererData->currentUploadBuffer[rendererData->currentCommandBufferIndex]++;
 
     /* If we've used up all the upload buffers, we need to issue the batch */
-    if (rendererData->currentUploadBuffer == SDL_VULKAN_NUM_UPLOAD_BUFFERS) {
+    if (rendererData->currentUploadBuffer[rendererData->currentCommandBufferIndex] == SDL_VULKAN_NUM_UPLOAD_BUFFERS) {
         VULKAN_IssueBatch(rendererData);
     }
 
@@ -3290,6 +3328,13 @@ static int VULKAN_RenderPresent(SDL_Renderer *renderer)
 
         vkEndCommandBuffer(rendererData->currentCommandBuffer);
 
+        result = vkResetFences(rendererData->device, 1, &rendererData->fences[rendererData->currentCommandBufferIndex]);
+        if (result != VK_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkResetFences(): %s\n", SDL_Vulkan_GetResultString(result));
+            return -1;
+        }
+
+
         VkPipelineStageFlags waitDestStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submitInfo = { 0 };
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -3298,29 +3343,36 @@ static int VULKAN_RenderPresent(SDL_Renderer *renderer)
         submitInfo.pWaitDstStageMask = &waitDestStageMask;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &rendererData->currentCommandBuffer;
-        //submitInfo.signalSemaphoreCount = 1;
-        //submitInfo.pSignalSemaphores = &vulkanContext->renderingFinishedSemaphore;
-        result = vkQueueSubmit(rendererData->graphicsQueue, 1, &submitInfo, NULL); // TODO-  fence data->fences[frameIndex]);
-        
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &rendererData->renderingFinishedSemaphore;
+        result = vkQueueSubmit(rendererData->graphicsQueue, 1, &submitInfo, rendererData->fences[rendererData->currentCommandBufferIndex]);
+        if (result != VK_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkQueueSubmit(): %s\n", SDL_Vulkan_GetResultString(result));
+            return -1;
+        }
         rendererData->currentCommandBuffer = VK_NULL_HANDLE;
-        
-        //TODO - this it temporary
-        vkDeviceWaitIdle(rendererData->device);
-        
+
         VkPresentInfoKHR presentInfo = { 0 };
         presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        //presentInfo.waitSemaphoreCount = 1;
-        //presentInfo.pWaitSemaphores = &vulkanContext->renderingFinishedSemaphore;
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = &rendererData->renderingFinishedSemaphore;
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &rendererData->swapchain;
         presentInfo.pImageIndices = &rendererData->currentSwapchainImageIndex;
         result = vkQueuePresentKHR(rendererData->presentQueue, &presentInfo);
-        // TODO: Handle this
+        if (result != VK_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkQueueSubmit(): %s\n", SDL_Vulkan_GetResultString(result));
+            return -1;
+        }
         
-        //TODO - this it temporary
-        vkDeviceWaitIdle(rendererData->device);
-
         rendererData->currentCommandBufferIndex = ( rendererData->currentCommandBufferIndex + 1 ) % rendererData->swapchainImageCount;
+
+        /* Wait for previous time this command buffer was submitted, will be N frames ago */
+        result = vkWaitForFences(rendererData->device, 1, &rendererData->fences[rendererData->currentCommandBufferIndex], VK_TRUE, UINT64_MAX);
+        if (result != VK_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkWaitForFences(): %s\n", SDL_Vulkan_GetResultString(result));
+            return -1;
+        }
     }
 
     VULKAN_AcquireNextSwapchainImage(rendererData);
