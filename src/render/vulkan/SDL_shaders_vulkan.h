@@ -35,6 +35,9 @@ typedef enum
     SHADER_YUV_JPEG,
     SHADER_YUV_BT601,
     SHADER_YUV_BT709,
+    SHADER_NV_JPEG,
+    SHADER_NV_BT601,
+    SHADER_NV_BT709,
 #endif
     NUM_SHADERS
 } VULKAN_Shader;
