@@ -3267,7 +3267,6 @@ static SDL_Surface* VULKAN_RenderReadPixels(SDL_Renderer *renderer, const SDL_Re
     VkDeviceSize length;
     VkDeviceSize readbackBufferSize;
     VkFormat vkFormat;
-    int status;
     SDL_Surface *output;
 
     VULKAN_EnsureCommandBuffer(rendererData);
