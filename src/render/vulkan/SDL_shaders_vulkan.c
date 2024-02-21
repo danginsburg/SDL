@@ -20,7 +20,7 @@
 */
 #include "SDL_internal.h"
 
-#if defined(SDL_VIDEO_RENDER_VULKAN) && !defined(SDL_RENDER_DISABLED)
+#if SDL_VIDEO_RENDER_VULKAN
 
 #include "SDL_shaders_vulkan.h"
 
@@ -1381,4 +1381,4 @@ void VULKAN_GetPixelShader(VULKAN_Shader shader, const uint32_t **outBytecode, s
     *outSize = VULKAN_shaders[shader].ps_shader_size;
 }
 
-#endif /* defined(SDL_VIDEO_RENDER_VULKAN) && !defined(SDL_RENDER_DISABLED) */
+#endif /* SDL_VIDEO_RENDER_VULKAN */

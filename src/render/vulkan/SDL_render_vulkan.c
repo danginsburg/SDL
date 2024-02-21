@@ -20,7 +20,7 @@
 */
 #include "SDL_internal.h"
 
-#if defined(SDL_VIDEO_RENDER_VULKAN) && !defined(SDL_RENDER_DISABLED)
+#if SDL_VIDEO_RENDER_VULKAN
 
 #define SDL_VULKAN_FRAME_QUEUE_DEPTH            2
 #define SDL_VULKAN_NUM_VERTEX_BUFFERS           256
@@ -3541,4 +3541,4 @@ SDL_RenderDriver VULKAN_RenderDriver = {
     }
 };
 
-#endif /* SDL_VIDEO_RENDER_VULKAN && !SDL_RENDER_DISABLED */
+#endif /* SDL_VIDEO_RENDER_VULKAN */
