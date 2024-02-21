@@ -22,7 +22,6 @@
 
 #if defined(SDL_VIDEO_RENDER_VULKAN) && !defined(SDL_RENDER_DISABLED)
 
-#include "../../core/windows/SDL_windows.h"
 #include "SDL_shaders_vulkan.h"
 
 

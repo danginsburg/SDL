@@ -101,9 +101,6 @@ static const SDL_RenderDriver *render_drivers[] = {
 #ifdef SDL_VIDEO_RENDER_METAL
     &METAL_RenderDriver,
 #endif
-#ifdef SDL_VIDEO_RENDER_VULKAN
-    &VULKAN_RenderDriver,
-#endif
 #ifdef SDL_VIDEO_RENDER_OGL
     &GL_RenderDriver,
 #endif
@@ -118,6 +115,9 @@ static const SDL_RenderDriver *render_drivers[] = {
 #endif
 #ifdef SDL_VIDEO_RENDER_VITA_GXM
     &VITA_GXM_RenderDriver,
+#endif
+#ifdef SDL_VIDEO_RENDER_VULKAN
+    &VULKAN_RenderDriver,
 #endif
 #if SDL_VIDEO_RENDER_SW
     &SW_RenderDriver

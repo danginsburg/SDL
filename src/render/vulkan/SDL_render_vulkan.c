@@ -1139,10 +1139,6 @@ static VkResult VULKAN_CreateVertexBuffer(VULKAN_RenderData *rendererData, size_
 
     VULKAN_DestroyBuffer(rendererData, &rendererData->vertexBuffers[vbidx]);
     
-    VkBufferCreateInfo bufferCreateInfo = { 0 };
-    bufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferCreateInfo.size = size;
-    bufferCreateInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
     result = VULKAN_AllocateBuffer(rendererData, size,
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
