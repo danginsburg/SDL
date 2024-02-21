@@ -718,15 +718,21 @@ static void VULKAN_RecordPipelineImageBarrier(VULKAN_RenderData *rendererData, V
     *imageLayout = destLayout;
 }
 
-static VkResult VULKAN_AcquireNextSwapchainImage(VULKAN_RenderData *rendererData)
+static VkResult VULKAN_AcquireNextSwapchainImage(SDL_Renderer *renderer)
 {
+    VULKAN_RenderData *rendererData = ( VULKAN_RenderData * )renderer->driverdata;
+
     VkResult result;
 
     result = vkAcquireNextImageKHR(rendererData->device, rendererData->swapchain, UINT64_MAX,
         rendererData->imageAvailableSemaphore, VK_NULL_HANDLE, &rendererData->currentSwapchainImageIndex);
-
-    if (result != VK_SUCCESS) {
-        //@TEMP - TODO: Handle out-of-date, suboptimal, etc.
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR) {
+        result = VULKAN_CreateWindowSizeDependentResources(renderer);
+        return result;
+    } else if(result == VK_SUBOPTIMAL_KHR) {
+        /* Suboptimal, but we can contiue */
+    }
+    else if (result != VK_SUCCESS) {
         SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkAcquireNextImageKHR(): %s\n", SDL_Vulkan_GetResultString(result));
         return result;
     }
@@ -1867,6 +1873,11 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
                                            rendererData->surfaceCapabilities.minImageExtent.height,
                                            rendererData->surfaceCapabilities.maxImageExtent.height);
 
+    if (rendererData->swapchainSize.width == 0 && rendererData->swapchainSize.height == 0) {
+        /* Don't recreate the swapchain if size is (0,0), just fail and continue attempting creation */
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+
 
     VkSwapchainCreateInfoKHR swapchainCreateInfo = { 0 };
     swapchainCreateInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -2102,7 +2113,7 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
     SDL_free(rendererData->currentUploadBuffer);
     rendererData->currentUploadBuffer = SDL_calloc(sizeof(int), rendererData->swapchainImageCount);
 
-    VULKAN_AcquireNextSwapchainImage(rendererData);
+    VULKAN_AcquireNextSwapchainImage(renderer);
     
     return result;
 }
@@ -2124,6 +2135,9 @@ static VkResult VULKAN_CreateWindowSizeDependentResources(SDL_Renderer *renderer
     SDL_GetWindowSizeInPixels(renderer->window, &w, &h);
 
     result = VULKAN_CreateSwapChain(renderer, w, h);
+    if (result != VK_SUCCESS) {
+        rendererData->pixelSizeChanged = VK_TRUE;
+    }
 
     rendererData->viewportDirty = SDL_TRUE;
 
@@ -3117,7 +3131,9 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
     SDL_memset(&stateCache, 0, sizeof(stateCache));
 
     if (rendererData->pixelSizeChanged) {
-        VULKAN_UpdateForWindowSizeChange(renderer);
+        if (VULKAN_UpdateForWindowSizeChange(renderer) != VK_SUCCESS) {
+            return -1;
+        }
         rendererData->pixelSizeChanged = SDL_FALSE;
     }
 
@@ -3392,8 +3408,8 @@ static int VULKAN_RenderPresent(SDL_Renderer *renderer)
         presentInfo.pSwapchains = &rendererData->swapchain;
         presentInfo.pImageIndices = &rendererData->currentSwapchainImageIndex;
         result = vkQueuePresentKHR(rendererData->presentQueue, &presentInfo);
-        if (result != VK_SUCCESS) {
-            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkQueueSubmit(): %s\n", SDL_Vulkan_GetResultString(result));
+        if ((result != VK_SUCCESS) && (result != VK_ERROR_OUT_OF_DATE_KHR) && (result != VK_ERROR_SURFACE_LOST_KHR) && (result != VK_SUBOPTIMAL_KHR )) {
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "vkQueuePresentKHR(): %s\n", SDL_Vulkan_GetResultString(result));
             return -1;
         }
         
@@ -3407,7 +3423,7 @@ static int VULKAN_RenderPresent(SDL_Renderer *renderer)
         }
     }
 
-    VULKAN_AcquireNextSwapchainImage(rendererData);
+    VULKAN_AcquireNextSwapchainImage(renderer);
     
     return (result == VK_SUCCESS);
 }
