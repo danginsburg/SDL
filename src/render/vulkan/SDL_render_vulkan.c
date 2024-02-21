@@ -366,6 +366,7 @@ static void VULKAN_DestroyBuffer(VULKAN_RenderData *rendererData, VULKAN_Buffer 
 static void VULKAN_DestroyImage(VULKAN_RenderData *rendererData, VULKAN_Image *vulkanImage);
 static void VULKAN_ResetCommandList(VULKAN_RenderData *rendererData);
 static SDL_bool VULKAN_FindMemoryTypeIndex(VULKAN_RenderData *rendererData, uint32_t typeBits, VkMemoryPropertyFlags flags, uint32_t *memoryTypeIndexOut);
+static VkResult VULKAN_CreateWindowSizeDependentResources(SDL_Renderer *renderer);
 
 static void VULKAN_DestroyAll(SDL_Renderer *renderer)
 {
@@ -894,7 +895,7 @@ static VkResult VULKAN_IssueBatch(VULKAN_RenderData *rendererData)
 
     VULKAN_ResetCommandList(rendererData);
 
-    return VK_SUCCESS;
+    return result;
 }
 
 static void VULKAN_DestroyRenderer(SDL_Renderer *renderer)
@@ -1499,7 +1500,7 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
         instanceExtensionsCopy[instanceCreateInfo.enabledExtensionCount] = SDL_strdup(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
         instanceCreateInfo.enabledExtensionCount++;
     }
-    instanceCreateInfo.ppEnabledExtensionNames = instanceExtensionsCopy;
+    instanceCreateInfo.ppEnabledExtensionNames = (const char* const*) instanceExtensionsCopy;
     if (createDebug && VULKAN_ValidationLayersFound()) {
         const char *validationLayerName[] = { "VK_LAYER_KHRONOS_validation" };
         instanceCreateInfo.ppEnabledLayerNames = validationLayerName;
@@ -1857,7 +1858,8 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
         rendererData->surfaceFormat = rendererData->surfaceFormats[0];
         rendererData->surfaceFormat.colorSpace = rendererData->surfaceFormats[0].colorSpace;
         for (uint32_t i = 0; i < rendererData->surfaceFormatsCount; i++) {
-            if (rendererData->surfaceFormats[i].format == desiredFormat) {
+            if (rendererData->surfaceFormats[i].format == desiredFormat &&
+                rendererData->surfaceFormats[i].colorSpace == desiredColorSpace) {
                 rendererData->surfaceFormat.colorSpace = rendererData->surfaceFormats[i].colorSpace;
                 rendererData->surfaceFormat = rendererData->surfaceFormats[i];
                 break;
@@ -1890,15 +1892,7 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
     swapchainCreateInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     swapchainCreateInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     swapchainCreateInfo.preTransform = rendererData->surfaceCapabilities.currentTransform;
-    //TODO
-#if 0
-    if (flags & SDL_WINDOW_TRANSPARENT) {
-        createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
-    } else 
-#endif
-    {
-        swapchainCreateInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    }
+    swapchainCreateInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     swapchainCreateInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR; // TODO
     swapchainCreateInfo.clipped = VK_TRUE;
     swapchainCreateInfo.oldSwapchain = rendererData->swapchain;
@@ -2123,7 +2117,7 @@ static VkResult VULKAN_CreateWindowSizeDependentResources(SDL_Renderer *renderer
 {
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
     VkResult result = VK_SUCCESS;
-    int i, w, h;
+    int w, h;
 
     /* Release resources in the current command list */
     VULKAN_IssueBatch(rendererData);
@@ -2950,8 +2944,10 @@ static SDL_bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderComm
         VkDescriptorImageInfo samplerDescriptor = { 0 };
         samplerDescriptor.sampler = sampler;
 
-        VkDescriptorImageInfo imageDescriptors[3] = { 0, 0, 0 };
-        VkWriteDescriptorSet descriptorWrites[4] = { 0, 0, 0, 0, };
+        VkDescriptorImageInfo imageDescriptors[3];
+        SDL_memset(imageDescriptors, 0, sizeof(imageDescriptors));
+        VkWriteDescriptorSet descriptorWrites[4];
+        SDL_memset(descriptorWrites, 0, sizeof(descriptorWrites));
         descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         descriptorWrites[0].dstSet = descriptorSet;
         descriptorWrites[0].dstBinding = 0;
