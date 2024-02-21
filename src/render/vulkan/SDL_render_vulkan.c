@@ -902,8 +902,10 @@ static VkResult VULKAN_IssueBatch(VULKAN_RenderData *rendererData)
 static void VULKAN_DestroyRenderer(SDL_Renderer *renderer)
 {
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->driverdata;
-    VULKAN_WaitForGPU(rendererData);
-    VULKAN_DestroyAll(renderer);
+    if (rendererData->device != VK_NULL_HANDLE) {
+        VULKAN_WaitForGPU(rendererData);
+        VULKAN_DestroyAll(renderer);
+    }
     if (rendererData) {
         SDL_free(rendererData);
     }
