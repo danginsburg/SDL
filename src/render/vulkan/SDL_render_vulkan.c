@@ -274,6 +274,7 @@ typedef struct
     VULKAN_PipelineState *pipelineStates;
     VULKAN_PipelineState *currentPipelineState;
 
+    SDL_bool supportsEXTSwapchainColorspace;
     uint32_t surfaceFormatsAllocatedCount;
     uint32_t surfaceFormatsCount;
     uint32_t swapchainDesiredImageCount;
@@ -1314,7 +1315,22 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
     appInfo.apiVersion = VK_API_VERSION_1_0;
     instanceCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instanceCreateInfo.pApplicationInfo = &appInfo;
-    instanceCreateInfo.ppEnabledExtensionNames = SDL_Vulkan_GetInstanceExtensions(&instanceCreateInfo.enabledExtensionCount);
+    char const* const* instanceExtensions = SDL_Vulkan_GetInstanceExtensions(&instanceCreateInfo.enabledExtensionCount);
+    rendererData->supportsEXTSwapchainColorspace = VK_FALSE;
+
+    if (renderer->output_colorspace == SDL_COLORSPACE_SCRGB ||
+        renderer->output_colorspace == SDL_COLORSPACE_HDR10) {
+        rendererData->supportsEXTSwapchainColorspace = VK_TRUE;
+        instanceCreateInfo.enabledExtensionCount++;
+    }
+    char **instanceExtensionsCopy = SDL_calloc(sizeof(const char *), instanceCreateInfo.enabledExtensionCount);
+    for (uint32_t i = 0; i < instanceCreateInfo.enabledExtensionCount - 1; i++) {
+        instanceExtensionsCopy[i] = SDL_strdup(instanceExtensions[i]);
+    }
+    if (rendererData->supportsEXTSwapchainColorspace) {
+        instanceExtensionsCopy[instanceCreateInfo.enabledExtensionCount - 1] = SDL_strdup(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+    }
+    instanceCreateInfo.ppEnabledExtensionNames = instanceExtensionsCopy;
     if (createDebug && VULKAN_ValidationLayersFound()) {
         const char *validationLayerName[] = { "VK_LAYER_KHRONOS_validation" };
         instanceCreateInfo.ppEnabledLayerNames = validationLayerName;
@@ -1326,6 +1342,10 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
         return result;
     }
 
+    for (uint32_t i = 0; i < instanceCreateInfo.enabledExtensionCount; i++) {
+        SDL_free(instanceExtensionsCopy[i]);
+    }
+    SDL_free(instanceExtensionsCopy);
     /* Load instance Vulkan functions */
     if (VULKAN_LoadInstanceFunctions(rendererData) != 0) {
         VULKAN_DestroyAll(renderer);
@@ -1645,8 +1665,17 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
     }
 
     VkFormat desiredFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    VkColorSpaceKHR desiredColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     if (renderer->colorspace_conversion && renderer->output_colorspace == SDL_COLORSPACE_SRGB) {
         desiredFormat = VK_FORMAT_B8G8R8A8_SRGB;
+    }
+    else if (renderer->output_colorspace == SDL_COLORSPACE_SCRGB) {
+        desiredFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        desiredColorSpace = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
+    }
+    else if (renderer->output_colorspace == SDL_COLORSPACE_HDR10) {
+        desiredFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        desiredColorSpace = VK_COLOR_SPACE_HDR10_ST2084_EXT;
     }
     
     if ((rendererData->surfaceFormatsCount == 1) &&
@@ -3274,8 +3303,8 @@ SDL_Renderer *VULKAN_CreateRenderer(SDL_Window *window, SDL_PropertiesID create_
     SDL_SetupRendererColorspace(renderer, create_props);
 
     if (renderer->output_colorspace != SDL_COLORSPACE_SRGB &&
-        renderer->output_colorspace != SDL_COLORSPACE_SCRGB
-        /*&& renderer->output_colorspace != SDL_COLORSPACE_HDR10*/) {
+        renderer->output_colorspace != SDL_COLORSPACE_SCRGB &&
+        renderer->output_colorspace != SDL_COLORSPACE_HDR10) {
         SDL_SetError("Unsupported output colorspace");
         SDL_free(renderer);
         return NULL;
