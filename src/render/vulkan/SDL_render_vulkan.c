@@ -2178,9 +2178,9 @@ static SDL_bool VULKAN_SupportsBlendMode(SDL_Renderer *renderer, SDL_BlendMode b
 
 static int GetTextureProperty(SDL_PropertiesID props, const char *name, VkImage *image)
 {
-    VkImage propImage = (VkImage)SDL_GetProperty(props, name, NULL);
+    VkImage *propImage = (VkImage*)SDL_GetProperty(props, name, NULL);
     if (propImage) {
-        *image = propImage;
+        *image = *propImage;
     }
     return 0;
 }
