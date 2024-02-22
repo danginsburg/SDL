@@ -3031,8 +3031,6 @@ static SDL_bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderComm
     VkFormat format = rendererData->surfaceFormat.format; // TEMP
     const Float4X4 *newmatrix = matrix ? matrix : &rendererData->identity;
     SDL_bool updateConstants = SDL_FALSE;
-    SDL_bool scRGB_output = SDL_RenderingLinearSpace(renderer);
-    float color_scale = cmd->data.draw.color_scale;
     PixelShaderConstants solid_constants;
     VkBuffer constantBuffer;
     VkDeviceSize constantBufferOffset;
