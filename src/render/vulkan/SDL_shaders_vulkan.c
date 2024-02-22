@@ -27,9 +27,7 @@
 /* The shaders here were compiled with compile_shaders.bat */
 #include "VULKAN_PixelShader_Colors.h"
 #include "VULKAN_PixelShader_Textures.h"
-#include "VULKAN_PixelShader_YUV.h"
-#include "VULKAN_PixelShader_NV.h"
-#include "VULKAN_PixelShader_HDR10.h"
+#include "VULKAN_PixelShader_Advanced.h"
 #include "VULKAN_VertexShader.h"
 
 static struct
@@ -43,14 +41,8 @@ static struct
       VULKAN_VertexShader, sizeof(VULKAN_VertexShader) },
     { VULKAN_PixelShader_Textures, sizeof(VULKAN_PixelShader_Textures),
       VULKAN_VertexShader, sizeof(VULKAN_VertexShader) },
-#if SDL_HAVE_YUV
-    { VULKAN_PixelShader_YUV, sizeof(VULKAN_PixelShader_YUV),
+    { VULKAN_PixelShader_Advanced, sizeof(VULKAN_PixelShader_Advanced),
       VULKAN_VertexShader, sizeof(VULKAN_VertexShader) },
-    { VULKAN_PixelShader_NV, sizeof(VULKAN_PixelShader_NV),
-      VULKAN_VertexShader, sizeof(VULKAN_VertexShader) },
-    { VULKAN_PixelShader_HDR10, sizeof(VULKAN_PixelShader_HDR10),
-      VULKAN_VertexShader, sizeof(VULKAN_VertexShader) },
-#endif
 };
 
 void VULKAN_GetVertexShader(VULKAN_Shader shader, const uint32_t **outBytecode, size_t *outSize)
