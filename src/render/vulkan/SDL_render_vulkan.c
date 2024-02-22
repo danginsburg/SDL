@@ -25,6 +25,7 @@
 #define SDL_VULKAN_FRAME_QUEUE_DEPTH            2
 #define SDL_VULKAN_NUM_VERTEX_BUFFERS           256
 #define SDL_VULKAN_VERTEX_BUFFER_DEFAULT_SIZE   65536
+#define SDL_VULKAN_CONSTANT_BUFFER_DEFAULT_SIZE 65536
 #define SDL_VULKAN_NUM_UPLOAD_BUFFERS           32
 #define SDL_VULKAN_MAX_DESCRIPTOR_SETS          4096
 
@@ -159,6 +160,16 @@ typedef struct
     Float4X4 projectionAndView;
 } VertexShaderConstants;
 
+/* Pixel shader constants, common values */
+typedef struct
+{
+    float scRGB_output;
+    float color_scale;
+    float unused1;
+    float unused2;
+    float YCbCr_matrix[16];
+} PixelShaderConstants;
+
 /* Per-vertex data */
 typedef struct
 {
@@ -199,6 +210,8 @@ typedef struct
     SDL_Rect lockedRect;
     int width;
     int height;
+    VULKAN_Shader shader;
+    const float *shader_params;
 
 #if SDL_HAVE_YUV
     /* YV12 texture support */
@@ -218,6 +231,9 @@ typedef struct
 typedef struct
 {
     VULKAN_Shader shader;
+    SDL_bool scRGB_output;
+    float color_scale;
+    const float *shader_params;
     SDL_BlendMode blendMode;
     VkPrimitiveTopology topology;
     VkFormat format;
@@ -271,6 +287,10 @@ typedef struct
     /* Data for staging/allocating textures */
     VULKAN_Buffer **uploadBuffers;
     int *currentUploadBuffer;
+
+    /* Data for updating constants */
+    VULKAN_Buffer *constantBuffers;
+    int32_t currentConstantBufferOffset;
 
     VkSampler samplers[SDL_VULKAN_NUM_SAMPLERS];
     VkDescriptorPool *descriptorPools;
@@ -349,7 +369,7 @@ static VkFormat SDLPixelFormatToVkTextureFormat(Uint32 format, Uint32 colorspace
         return VK_FORMAT_R16G16B16A16_SFLOAT;
     case SDL_PIXELFORMAT_ARGB8888:
     case SDL_PIXELFORMAT_XRGB8888:
-        if (colorspace == SDL_COLORSPACE_SRGB) {
+        if (colorspace == SDL_COLORSPACE_SCRGB) {
             return VK_FORMAT_B8G8R8A8_SRGB;
         }
         return VK_FORMAT_B8G8R8A8_UNORM;
@@ -499,6 +519,14 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
         }
         SDL_free(rendererData->uploadBuffers);
         SDL_free(rendererData->currentUploadBuffer);
+    }
+
+    if (rendererData->constantBuffers) {
+        for (uint32_t i = 0; i < rendererData->swapchainImageCount; ++i) {
+            VULKAN_DestroyBuffer(rendererData, &rendererData->constantBuffers[i]);
+        }
+        SDL_free(rendererData->constantBuffers);
+        rendererData->constantBuffers = NULL;
     }
     
     if (rendererData->device != VK_NULL_HANDLE) {
@@ -861,6 +889,7 @@ static void VULKAN_ResetCommandList(VULKAN_RenderData *rendererData)
     rendererData->issueBatch = SDL_FALSE;
     rendererData->cliprectDirty = SDL_TRUE;
     rendererData->currentDescriptorSetIndex = 0;
+    rendererData->currentConstantBufferOffset = -1;
 
     /* Release any upload buffers that were inflight */
     for (uint32_t i = 0; i < rendererData->currentUploadBuffer[rendererData->currentCommandBufferIndex]; ++i) {
@@ -1613,56 +1642,56 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer)
         VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCreateInfo = { 0 };
         descriptorSetLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         descriptorSetLayoutCreateInfo.flags = 0;
-        VkDescriptorSetLayoutBinding layoutBindings[4];
+        VkDescriptorSetLayoutBinding layoutBindings[5];
+        /* PixelShaderConstants */
+        layoutBindings[0].binding = 4;
+        layoutBindings[0].descriptorCount = 1;
+        layoutBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        layoutBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        layoutBindings[0].pImmutableSamplers = NULL;
+
+        /* theSampler */
+        layoutBindings[1].binding = 0;
+        layoutBindings[1].descriptorCount = 1;
+        layoutBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        layoutBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        layoutBindings[1].pImmutableSamplers = NULL;
+
+        /* theTexture */
+        layoutBindings[2].binding = 1;
+        layoutBindings[2].descriptorCount = 1;
+        layoutBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        layoutBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        layoutBindings[2].pImmutableSamplers = NULL;
+
         /* Color */
         if (i == SHADER_SOLID) {
-            descriptorSetLayoutCreateInfo.bindingCount = 0;
-            descriptorSetLayoutCreateInfo.pBindings = NULL;
+            descriptorSetLayoutCreateInfo.bindingCount = 1;
+            descriptorSetLayoutCreateInfo.pBindings = layoutBindings;
         }
         /* Texture */
         else if (i == SHADER_RGB) {
-            layoutBindings[0].binding = 0;
-            layoutBindings[0].descriptorCount = 1;
-            layoutBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-            layoutBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-            layoutBindings[0].pImmutableSamplers = NULL;
-
-            layoutBindings[1].binding = 1;
-            layoutBindings[1].descriptorCount = 1;
-            layoutBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            layoutBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-            layoutBindings[1].pImmutableSamplers = NULL;
-            descriptorSetLayoutCreateInfo.bindingCount = 2;
+            descriptorSetLayoutCreateInfo.bindingCount = 3;
             descriptorSetLayoutCreateInfo.pBindings = layoutBindings;
         }
         /* YUV / NV12 */
-        else if (i >= SHADER_YUV_JPEG && i <= SHADER_NV_BT709) {
-            layoutBindings[0].binding = 0;
-            layoutBindings[0].descriptorCount = 1;
-            layoutBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-            layoutBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-            layoutBindings[0].pImmutableSamplers = NULL;
-
-            layoutBindings[1].binding = 1;
-            layoutBindings[1].descriptorCount = 1;
-            layoutBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            layoutBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-            layoutBindings[1].pImmutableSamplers = NULL;
-
-            layoutBindings[2].binding = 2;
-            layoutBindings[2].descriptorCount = 1;
-            layoutBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            layoutBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-            layoutBindings[2].pImmutableSamplers = NULL;
-
-            layoutBindings[3].binding = 3;
+        else if (i >= SHADER_YUV && i <= SHADER_NV) {
+            /* theTextureU / theTexture UV */
+            layoutBindings[3].binding = 2;
             layoutBindings[3].descriptorCount = 1;
             layoutBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
             layoutBindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
             layoutBindings[3].pImmutableSamplers = NULL;
 
+            /* theTextureV */
+            layoutBindings[4].binding = 3;
+            layoutBindings[4].descriptorCount = 1;
+            layoutBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            layoutBindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            layoutBindings[4].pImmutableSamplers = NULL;
+
             /* YUV has 3 textures and one sampler (4 total), NV12/NV21 has 2 textures and one sampler (3 total) */
-            descriptorSetLayoutCreateInfo.bindingCount = (i >= SHADER_YUV_JPEG && i <= SHADER_YUV_BT709) ? 4 : 3;
+            descriptorSetLayoutCreateInfo.bindingCount = (i == SHADER_YUV) ? 5 :4;
             descriptorSetLayoutCreateInfo.pBindings = layoutBindings;
         }
         result = vkCreateDescriptorSetLayout(rendererData->device, &descriptorSetLayoutCreateInfo, NULL, &rendererData->descriptorSetLayouts[i]);
@@ -1836,10 +1865,7 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
 
     VkFormat desiredFormat = VK_FORMAT_B8G8R8A8_UNORM;
     VkColorSpaceKHR desiredColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-    if (renderer->output_colorspace == SDL_COLORSPACE_SRGB) {
-        desiredFormat = VK_FORMAT_B8G8R8A8_SRGB;
-    }
-    else if (renderer->output_colorspace == SDL_COLORSPACE_SCRGB) {
+    if (renderer->output_colorspace == SDL_COLORSPACE_SCRGB) {
         desiredFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
         desiredColorSpace = VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
     }
@@ -2106,6 +2132,30 @@ static VkResult VULKAN_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
     SDL_free(rendererData->currentUploadBuffer);
     rendererData->currentUploadBuffer = SDL_calloc(sizeof(int), rendererData->swapchainImageCount);
 
+    /* Constant buffers */
+    if (rendererData->constantBuffers) {
+        for (uint32_t i = 0; i < rendererData->swapchainImageCount; i++) {
+            VULKAN_DestroyBuffer(rendererData, &rendererData->constantBuffers[i]);
+        }
+        SDL_free(rendererData->constantBuffers);
+    }
+    rendererData->constantBuffers = SDL_calloc(sizeof(VULKAN_Buffer), rendererData->swapchainImageCount);
+    for (uint32_t i = 0; i < rendererData->swapchainImageCount; i++) {
+        result = VULKAN_AllocateBuffer(rendererData,
+            SDL_VULKAN_CONSTANT_BUFFER_DEFAULT_SIZE,
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &rendererData->constantBuffers[i]);
+        if (result != VK_SUCCESS) {
+            VULKAN_DestroyAll(renderer);
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "VULKAN_AllocateBuffer(): %s\n", SDL_Vulkan_GetResultString(result));
+            return result;
+        }
+    }
+    rendererData->currentConstantBufferOffset = -1;
+
     VULKAN_AcquireNextSwapchainImage(renderer);
     
     return result;
@@ -2195,7 +2245,7 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
     VkFormat textureFormat = SDLPixelFormatToVkTextureFormat(texture->format,  texture->colorspace);
     uint32_t width = texture->w;
     uint32_t height = texture->h;
-    
+
     if (textureFormat == VK_FORMAT_UNDEFINED) {
         return SDL_SetError("%s, An unsupported SDL pixel format (0x%x) was specified", __FUNCTION__, texture->format);
     }
@@ -2205,8 +2255,15 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
         return -1;
     }
     texture->driverdata = textureData;
-
+    textureData->shader = SHADER_RGB;
     textureData->scaleMode = (texture->scaleMode == SDL_SCALEMODE_NEAREST) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    
+    /* NV12 textures must have even width and height */
+    if (texture->format == SDL_PIXELFORMAT_NV12 ||
+        texture->format == SDL_PIXELFORMAT_NV21) {
+        width = (width + 1) & ~1;
+        height = (height + 1) & ~1;
+    }
     textureData->width = width;
     textureData->height = height;
 
@@ -2262,6 +2319,12 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
             return result;
         }
         SDL_SetProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_VULKAN_TEXTURE_V_POINTER, &textureData->mainImageV.image);
+
+        textureData->shader = SHADER_YUV;
+        textureData->shader_params = SDL_GetYCbCRtoRGBConversionMatrix(texture->colorspace, texture->w, texture->h, 8);
+        if (!textureData->shader_params) {
+            return SDL_SetError("Unsupported YUV colorspace");
+        }
     }
     else if (texture->format == SDL_PIXELFORMAT_NV12 || texture->format == SDL_PIXELFORMAT_NV21) {
         textureData->nv12 = SDL_TRUE;
@@ -2281,6 +2344,12 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
             VULKAN_DestroyTexture(renderer, texture);
             SDL_LogError(SDL_LOG_CATEGORY_RENDER, "VULKAN_AllocateImage(): %s\n", SDL_Vulkan_GetResultString(result));
             return result;
+        }
+
+        textureData->shader = SHADER_NV;
+        textureData->shader_params = SDL_GetYCbCRtoRGBConversionMatrix(texture->colorspace, texture->w, texture->h, 8);
+        if (!textureData->shader_params) {
+            return SDL_SetError("Unsupported YUV colorspace");
         }
     }
 #endif
@@ -2706,6 +2775,7 @@ static int VULKAN_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd
 {
     VertexPositionColor *verts = (VertexPositionColor *)SDL_AllocateRenderVertices(renderer, count * sizeof(VertexPositionColor), 0, &cmd->data.draw.first);
     int i;
+    SDL_bool convert_color = SDL_RenderingLinearSpace(renderer);
 
     if (!verts) {
         return -1;
@@ -2718,6 +2788,9 @@ static int VULKAN_QueueDrawPoints(SDL_Renderer *renderer, SDL_RenderCommand *cmd
         verts->tex[0] = 0.0f;
         verts->tex[1] = 0.0f;
         verts->color = cmd->data.draw.color;
+        if (convert_color) {
+            SDL_ConvertToLinear(&verts->color);
+        }
         verts++;
     }
     return 0;
@@ -2731,6 +2804,10 @@ static int VULKAN_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
     int i;
     int count = indices ? num_indices : num_vertices;
     VertexPositionColor *verts = (VertexPositionColor *)SDL_AllocateRenderVertices(renderer, count * sizeof(VertexPositionColor), 0, &cmd->data.draw.first);
+    SDL_bool convert_color = SDL_RenderingLinearSpace(renderer);
+    VULKAN_TextureData *textureData = texture ? (VULKAN_TextureData *)texture->driverdata : NULL;
+    float u_scale = textureData ? (float)texture->w / textureData->width : 0.0f;
+    float v_scale = textureData ? (float)texture->h / textureData->height : 0.0f;
 
     if (!verts) {
         return -1;
@@ -2757,11 +2834,14 @@ static int VULKAN_QueueGeometry(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
         verts->pos[0] = xy_[0] * scale_x;
         verts->pos[1] = xy_[1] * scale_y;
         verts->color = *(SDL_FColor *)((char *)color + j * color_stride);
+        if (convert_color) {
+            SDL_ConvertToLinear(&verts->color);
+        }
 
         if (texture) {
             float *uv_ = (float *)((char *)uv + j * uv_stride);
-            verts->tex[0] = uv_[0];
-            verts->tex[1] = uv_[1];
+            verts->tex[0] = uv_[0] * u_scale;
+            verts->tex[1] = uv_[1] * v_scale;
         } else {
             verts->tex[0] = 0.0f;
             verts->tex[1] = 0.0f;
@@ -2859,7 +2939,7 @@ static int VULKAN_UpdateViewport(SDL_Renderer *renderer)
     return 0;
 }
 
-static SDL_bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderCommand *cmd, VULKAN_Shader shader,
+static SDL_bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderCommand *cmd, VULKAN_Shader shader, const float *shader_params,
                               VkPrimitiveTopology topology, int imageViewCount, VkImageView *imageViews, VkSampler sampler, const Float4X4 *matrix, VULKAN_DrawStateCache *stateCache)
 
 {
@@ -2867,7 +2947,11 @@ static SDL_bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderComm
     const SDL_BlendMode blendMode = cmd->data.draw.blend;
     VkFormat format = rendererData->surfaceFormat.format; // TEMP
     const Float4X4 *newmatrix = matrix ? matrix : &rendererData->identity;
-    SDL_bool updatePushConstants = SDL_FALSE;
+    SDL_bool updateConstants = SDL_FALSE;
+    SDL_bool scRGB_output = SDL_RenderingLinearSpace(renderer);
+    float color_scale = cmd->data.draw.color_scale;
+    VkBuffer constantBuffer;
+    VkDeviceSize constantBufferOffset;
     int i;
 
     if (!VULKAN_ActivateCommandBuffer(renderer, VK_ATTACHMENT_LOAD_OP_LOAD, NULL, stateCache)) {
@@ -2903,23 +2987,69 @@ static SDL_bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderComm
         }
 
         vkCmdBindPipeline(rendererData->currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, rendererData->currentPipelineState->pipeline);
+        updateConstants = SDL_TRUE;
     }
 
     if (rendererData->viewportDirty) {
         if (VULKAN_UpdateViewport(renderer) == 0) {
             /* vertexShaderConstantsData.projectionAndView has changed */
-            updatePushConstants = SDL_TRUE;
+            updateConstants = SDL_TRUE;
         }
     }
 
-    if (updatePushConstants == SDL_TRUE || SDL_memcmp(&rendererData->vertexShaderConstantsData.model, newmatrix, sizeof(*newmatrix)) != 0) {
+    if (updateConstants == SDL_TRUE || SDL_memcmp(&rendererData->vertexShaderConstantsData.model, newmatrix, sizeof(*newmatrix)) != 0) {
         SDL_memcpy(&rendererData->vertexShaderConstantsData.model, newmatrix, sizeof(*newmatrix));
         vkCmdPushConstants(rendererData->currentCommandBuffer, rendererData->currentPipelineState->pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
             sizeof(rendererData->vertexShaderConstantsData),
             &rendererData->vertexShaderConstantsData);
     }
 
-    if (imageViews != NULL && sampler != VK_NULL_HANDLE) {
+    constantBuffer = rendererData->constantBuffers[rendererData->currentCommandBufferIndex].buffer;
+    constantBufferOffset = (rendererData->currentConstantBufferOffset < 0) ? 0 : rendererData->currentConstantBufferOffset;
+    if (updateConstants ||
+        scRGB_output != rendererData->currentPipelineState->scRGB_output ||
+        color_scale != rendererData->currentPipelineState->color_scale ||
+        (shader_params && shader_params != rendererData->currentPipelineState->shader_params)) {
+
+        PixelShaderConstants constants;
+
+        constants.scRGB_output = (float)scRGB_output;
+        constants.color_scale = color_scale;
+
+        if (shader_params) {
+            SDL_memcpy(constants.YCbCr_matrix, shader_params, sizeof(constants.YCbCr_matrix));
+        }
+
+        if (rendererData->currentConstantBufferOffset == -1) {
+            /* First time, grab offset 0 */
+            rendererData->currentConstantBufferOffset = 0;
+            constantBufferOffset = 0;
+        }
+        else {
+            /* Align the next address to the minUniformBufferOffsetAlignment */
+            VkDeviceSize alignment = rendererData->physicalDeviceProperties.limits.minUniformBufferOffsetAlignment;
+            SDL_assert(rendererData->currentConstantBufferOffset >= 0 );
+            rendererData->currentConstantBufferOffset += (sizeof(PixelShaderConstants) + alignment - 1) & ~(alignment - 1);
+            constantBufferOffset = rendererData->currentConstantBufferOffset;
+        }
+
+        /* Upload constants to persistently mapped buffer */
+        if (rendererData->currentConstantBufferOffset > SDL_VULKAN_CONSTANT_BUFFER_DEFAULT_SIZE) {
+            VULKAN_IssueBatch(rendererData);
+            rendererData->currentConstantBufferOffset = 0;
+            constantBufferOffset = 0;
+        }
+        uint8_t *dst = rendererData->constantBuffers[rendererData->currentCommandBufferIndex].mappedBufferPtr;
+        dst += constantBufferOffset;
+        SDL_memcpy(dst, &constants, sizeof(PixelShaderConstants));
+
+        rendererData->currentPipelineState->scRGB_output = scRGB_output;
+        rendererData->currentPipelineState->color_scale = color_scale;
+        rendererData->currentPipelineState->shader_params = shader_params;
+    }
+
+    /* Allocate the descriptor set */
+    {
         VkDescriptorSetAllocateInfo descriptorSetAllocateInfo = { 0 };
         descriptorSetAllocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         descriptorSetAllocateInfo.descriptorSetCount = 1;
@@ -2945,28 +3075,48 @@ static SDL_bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderComm
 
         VkDescriptorImageInfo imageDescriptors[3];
         SDL_memset(imageDescriptors, 0, sizeof(imageDescriptors));
-        VkWriteDescriptorSet descriptorWrites[4];
+        VkDescriptorBufferInfo bufferDescriptor = { 0 };
+        bufferDescriptor.buffer = constantBuffer;
+        bufferDescriptor.offset = constantBufferOffset;
+        bufferDescriptor.range = sizeof(PixelShaderConstants);
+
+        VkWriteDescriptorSet descriptorWrites[5];
         SDL_memset(descriptorWrites, 0, sizeof(descriptorWrites));
+        uint32_t descriptorCount = 1; /* Always have the uniform buffer */
+
         descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         descriptorWrites[0].dstSet = descriptorSet;
-        descriptorWrites[0].dstBinding = 0;
+        descriptorWrites[0].dstBinding = 4;
         descriptorWrites[0].dstArrayElement = 0;
         descriptorWrites[0].descriptorCount = 1;
-        descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-        descriptorWrites[0].pImageInfo = &samplerDescriptor;
+        descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptorWrites[0].pBufferInfo = &bufferDescriptor;
 
+        if (sampler != VK_NULL_HANDLE) {
+            descriptorCount++;
+            descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[1].dstSet = descriptorSet;
+            descriptorWrites[1].dstBinding = 0;
+            descriptorWrites[1].dstArrayElement = 0;
+            descriptorWrites[1].descriptorCount = 1;
+            descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            descriptorWrites[1].pImageInfo = &samplerDescriptor;
+        }
+
+        uint32_t startImageViews = descriptorCount;
         for (i = 0; i < imageViewCount; i++) {
+            descriptorCount++;
             imageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             imageDescriptors[i].imageView = imageViews[i];
-            descriptorWrites[i+1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            descriptorWrites[i+1].dstSet = descriptorSet;
-            descriptorWrites[i+1].dstBinding = 1 + i;
-            descriptorWrites[i+1].dstArrayElement = 0;
-            descriptorWrites[i+1].descriptorCount = 1;
-            descriptorWrites[i+1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            descriptorWrites[i+1].pImageInfo = &imageDescriptors[i];
+            descriptorWrites[i+startImageViews].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[i+startImageViews].dstSet = descriptorSet;
+            descriptorWrites[i+startImageViews].dstBinding = 1 + i;
+            descriptorWrites[i+startImageViews].dstArrayElement = 0;
+            descriptorWrites[i+startImageViews].descriptorCount = 1;
+            descriptorWrites[i+startImageViews].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            descriptorWrites[i+startImageViews].pImageInfo = &imageDescriptors[i];
         }
-        vkUpdateDescriptorSets(rendererData->device, imageViewCount + 1, descriptorWrites, 0, NULL);
+        vkUpdateDescriptorSets(rendererData->device, descriptorCount, descriptorWrites, 0, NULL);
         vkCmdBindDescriptorSets(rendererData->currentCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, rendererData->currentPipelineState->pipelineLayout,
             0, 1, &descriptorSet, 0, NULL);
     }
@@ -2993,7 +3143,7 @@ static SDL_bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderComm
         return SDL_SetError("Unknown scale mode: %d\n", textureData->scaleMode);
     }
 
-    if (!VULKAN_SetDrawState(renderer, cmd, SHADER_RGB, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 1, &textureData->mainImage.imageView,
+    if (!VULKAN_SetDrawState(renderer, cmd, SHADER_RGB, NULL, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 1, &textureData->mainImage.imageView,
                               textureSampler, matrix, stateCache)) {
         return SDL_FALSE;
     }
@@ -3022,23 +3172,6 @@ static SDL_bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderComm
 
 #if SDL_HAVE_YUV
     if (textureData->yuv) {
-        VULKAN_Shader shader;
-
-        /* @TEMP - need to turn these into constants
-        switch (SDL_GetYUVConversionModeForResolution(texture->w, texture->h)) {
-        case SDL_YUV_CONVERSION_JPEG:
-            shader = SHADER_YUV_JPEG;
-            break;
-        case SDL_YUV_CONVERSION_BT601:
-            shader = SHADER_YUV_BT601;
-            break;
-        case SDL_YUV_CONVERSION_BT709:
-            shader = SHADER_YUV_BT709;
-            break;
-        default:
-            return SDL_SetError("Unsupported YUV conversion mode");
-        } */
-        shader = SHADER_YUV_JPEG;
 
         /* Make sure each texture is in the correct state to be accessed by the pixel shader. */
         VULKAN_RecordPipelineImageBarrier(rendererData,
@@ -3064,26 +3197,9 @@ static SDL_bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderComm
             textureData->mainImageV.imageView
         };
 
-        return VULKAN_SetDrawState(renderer, cmd, shader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, SDL_arraysize(imageViews), imageViews,
+        return VULKAN_SetDrawState(renderer, cmd, textureData->shader, textureData->shader_params, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, SDL_arraysize(imageViews), imageViews,
                                   textureSampler, matrix, stateCache);
     } else if (textureData->nv12) {
-        VULKAN_Shader shader;
-
-        /* @TEMP need to turn these into constantas
-        switch (SDL_GetYUVConversionModeForResolution(texture->w, texture->h)) {
-        case SDL_YUV_CONVERSION_JPEG:
-            shader = SHADER_NV_JPEG;
-            break;
-        case SDL_YUV_CONVERSION_BT601:
-            shader = SHADER_NV_BT601;
-            break;
-        case SDL_YUV_CONVERSION_BT709:
-            shader = SHADER_NV_BT709;
-            break;
-        default:
-            return SDL_SetError("Unsupported YUV conversion mode");
-        }*/
-        shader = SHADER_NV_JPEG;
 
         /* Make sure each texture is in the correct state to be accessed by the pixel shader. */
          VULKAN_RecordPipelineImageBarrier(rendererData,
@@ -3100,7 +3216,7 @@ static SDL_bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderComm
             textureData->mainImageUV.imageView,
         };
 
-        return VULKAN_SetDrawState(renderer, cmd, shader, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, SDL_arraysize(imageViews), imageViews,
+        return VULKAN_SetDrawState(renderer, cmd, textureData->shader, textureData->shader_params, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, SDL_arraysize(imageViews), imageViews,
                                   textureSampler, matrix, stateCache);
     }
 #endif
@@ -3121,6 +3237,7 @@ static void VULKAN_InvalidateCachedState(SDL_Renderer *renderer)
     rendererData->issueBatch = SDL_FALSE;
     rendererData->cliprectDirty = SDL_TRUE;
     rendererData->currentDescriptorSetIndex = 0;
+    rendererData->currentConstantBufferOffset = 0;
 }
 
 static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
@@ -3188,11 +3305,17 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
 
         case SDL_RENDERCMD_CLEAR:
         {
+            SDL_bool convert_color = SDL_RenderingLinearSpace(renderer);
+            SDL_FColor color = cmd->data.color.color;
+            if (convert_color) {
+                SDL_ConvertToLinear(&color);
+            }
+
             VkClearColorValue clearColor;
-            clearColor.float32[0] = cmd->data.color.color.r;
-            clearColor.float32[1] = cmd->data.color.color.g;
-            clearColor.float32[2] = cmd->data.color.color.b;
-            clearColor.float32[3] = cmd->data.color.color.a;
+            clearColor.float32[0] = color.r;
+            clearColor.float32[1] = color.g;
+            clearColor.float32[2] = color.b;
+            clearColor.float32[3] = color.a;
             VULKAN_ActivateCommandBuffer(renderer, VK_ATTACHMENT_LOAD_OP_CLEAR, &clearColor, &stateCache);
             break;
         }
@@ -3202,7 +3325,7 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
             const size_t count = cmd->data.draw.count;
             const size_t first = cmd->data.draw.first;
             const size_t start = first / sizeof(VertexPositionColor);
-            VULKAN_SetDrawState(renderer, cmd, SHADER_SOLID, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, VK_NULL_HANDLE, NULL, &stateCache);
+            VULKAN_SetDrawState(renderer, cmd, SHADER_SOLID, NULL, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, VK_NULL_HANDLE, NULL, &stateCache);
             VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, start, count);
             break;
         }
@@ -3213,10 +3336,10 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
             const size_t first = cmd->data.draw.first;
             const size_t start = first / sizeof(VertexPositionColor);
             const VertexPositionColor *verts = (VertexPositionColor *)(((Uint8 *)vertices) + first);
-            VULKAN_SetDrawState(renderer, cmd, SHADER_SOLID, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, 0, NULL, VK_NULL_HANDLE, NULL, &stateCache);
+            VULKAN_SetDrawState(renderer, cmd, SHADER_SOLID, NULL, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, 0, NULL, VK_NULL_HANDLE, NULL, &stateCache);
             VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, start, count);
             if (verts[0].pos[0] != verts[count - 1].pos[0] || verts[0].pos[1] != verts[count - 1].pos[1]) {
-                VULKAN_SetDrawState(renderer, cmd, SHADER_SOLID, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, VK_NULL_HANDLE, NULL, &stateCache);
+                VULKAN_SetDrawState(renderer, cmd, SHADER_SOLID, NULL, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, VK_NULL_HANDLE, NULL, &stateCache);
                 VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, start + (count - 1), 1);
             }
             break;
@@ -3241,7 +3364,7 @@ static int VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd
             if (texture) {
                 VULKAN_SetCopyState(renderer, cmd, NULL, &stateCache);
             } else {
-                VULKAN_SetDrawState(renderer, cmd, SHADER_SOLID, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, NULL, VK_NULL_HANDLE, NULL, &stateCache);
+                VULKAN_SetDrawState(renderer, cmd, SHADER_SOLID, NULL, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, NULL, VK_NULL_HANDLE, NULL, &stateCache);
             }
 
             VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, start, count);
