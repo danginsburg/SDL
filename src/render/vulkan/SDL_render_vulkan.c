@@ -2367,6 +2367,9 @@ static int VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, SD
             bits_per_pixel = 8;
             break;
         }
+
+        SDL_SetProperty(SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_VULKAN_TEXTURE_UV_POINTER, &textureData->mainImageUV.image);
+
         textureData->YCbCr_matrix = SDL_GetYCbCRtoRGBConversionMatrix(texture->colorspace, texture->w, texture->h, bits_per_pixel);
         if (!textureData->YCbCr_matrix) {
             return SDL_SetError("Unsupported YUV colorspace");
@@ -3458,7 +3461,7 @@ static SDL_Surface* VULKAN_RenderReadPixels(SDL_Renderer *renderer, const SDL_Re
     VkImage backBuffer;
     VkImageLayout *imageLayout;
     VULKAN_Buffer readbackBuffer;
-    VkDeviceSize pixelSize; 
+    VkDeviceSize pixelSize;
     VkDeviceSize length;
     VkDeviceSize readbackBufferSize;
     VkFormat vkFormat;
